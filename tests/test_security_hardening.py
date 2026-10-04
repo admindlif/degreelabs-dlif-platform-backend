@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.routes import admin as admin_routes
+from app.core.auth_cookies import ONBOARDING_COOKIE_NAME
 from app.core.config import Settings
 from app.models.user import AccountStatus, User
 from app.models.user_invitation import UserInvitationToken
@@ -49,6 +50,7 @@ def test_cors_origins_are_environment_driven_and_production_safe():
         "https://fellows.example.com",
         "https://admin.example.com",
     ]
+    assert production.effective_auth_cookie_secure is True
 
     with pytest.raises(ValidationError):
         _settings(environment="production")
@@ -60,6 +62,15 @@ def test_cors_origins_are_environment_driven_and_production_safe():
             smtp_username="mailer",
             smtp_password="configured-at-runtime",
             cors_allowed_origins="http://localhost:3000",
+        )
+
+    with pytest.raises(ValidationError):
+        _settings(
+            environment="production",
+            email_backend="smtp",
+            smtp_username="mailer",
+            smtp_password="configured-at-runtime",
+            auth_cookie_secure=False,
         )
 
 
@@ -186,8 +197,9 @@ def test_invited_fellow_can_resume_onboarding_but_active_account_cannot(
             json={"email": email, "password": password},
         )
         assert resumed.status_code == 200
-        assert "onboarding_token" in resumed.json()
+        assert "onboarding_token" not in resumed.json()
         assert "access_token" not in resumed.json()
+        assert client.cookies.get(ONBOARDING_COOKIE_NAME) is not None
 
         unknown = client.post(
             "/api/v1/auth/onboarding/resume",

@@ -1,17 +1,21 @@
-"""
-Authentication routes.
+"""Authentication and Fellow onboarding routes."""
 
-POST /api/v1/auth/activate       — activate account with invitation token
-POST /api/v1/auth/2fa/setup      — generate TOTP secret after activation
-POST /api/v1/auth/2fa/confirm    — verify first TOTP code and activate account
-POST /api/v1/auth/login          — stage 1: validate password, return challenge token
-POST /api/v1/auth/2fa/verify     — stage 2: verify TOTP, issue access token
-GET  /api/v1/auth/me             — return current user profile
-"""
+from io import BytesIO
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import qrcode
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
+from app.core.auth_cookies import (
+    TWO_FA_CHALLENGE_COOKIE_NAME,
+    clear_access_cookie,
+    clear_all_auth_cookies,
+    clear_onboarding_cookie,
+    clear_two_fa_challenge_cookie,
+    set_access_cookie,
+    set_onboarding_cookie,
+    set_two_fa_challenge_cookie,
+)
 from app.core.permissions import (
     require_authenticated_user,
     require_onboarding_user,
@@ -19,19 +23,20 @@ from app.core.permissions import (
 from app.core.security import (
     create_access_token,
     create_onboarding_token,
+    get_totp_uri,
 )
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.auth import (
     ActivateAccountRequest,
     ActivateAccountResponse,
+    AuthenticationResponse,
     ConfirmTwoFARequest,
     ConfirmTwoFAResponse,
     LoginRequest,
     LoginResponse,
     OnboardingResumeRequest,
     OnboardingResumeResponse,
-    TokenResponse,
     TwoFASetupResponse,
     UserResponse,
     VerifyTOTPRequest,
@@ -47,21 +52,17 @@ from app.services.auth import (
     activate_account,
     complete_2fa_login,
     confirm_2fa,
-    setup_2fa,
     resume_onboarding,
+    setup_2fa,
     verify_login_credentials,
 )
 
 
-router = APIRouter(
-    prefix="/auth",
-    tags=["Authentication"],
-)
+router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
-# ---------------------------------------------------------------------------
-# Account activation
-# ---------------------------------------------------------------------------
+def _prevent_caching(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store"
 
 
 @router.post(
@@ -72,15 +73,10 @@ router = APIRouter(
 )
 def activate(
     data: ActivateAccountRequest,
+    response: Response,
     db: Session = Depends(get_db),
 ) -> ActivateAccountResponse:
-    """
-    Step 1 of student onboarding.
-
-    Validates the invitation token, sets the password, and marks the
-    email as verified.  The account is **not yet active** — the student
-    must complete 2FA setup next.
-    """
+    """Set the invited Fellow's password and begin the 2FA setup session."""
     try:
         user = activate_account(db, data)
     except (InvalidInvitationError, AccountNotInvitedError) as exc:
@@ -94,9 +90,10 @@ def activate(
             detail=str(exc),
         ) from exc
 
-    onboarding_token = create_onboarding_token(
-        str(user.id)
-    )
+    set_onboarding_cookie(response, create_onboarding_token(str(user.id)))
+    clear_access_cookie(response)
+    clear_two_fa_challenge_cookie(response)
+    _prevent_caching(response)
 
     return ActivateAccountResponse(
         message=(
@@ -105,7 +102,6 @@ def activate(
         ),
         user_id=user.id,
         email=user.email,
-        onboarding_token=onboarding_token,
     )
 
 
@@ -117,6 +113,7 @@ def activate(
 )
 def resume_incomplete_onboarding(
     data: OnboardingResumeRequest,
+    response: Response,
     db: Session = Depends(get_db),
 ) -> OnboardingResumeResponse:
     try:
@@ -127,39 +124,65 @@ def resume_incomplete_onboarding(
             detail="Unable to resume onboarding with the supplied credentials.",
         ) from exc
 
+    set_onboarding_cookie(response, create_onboarding_token(str(user.id)))
+    clear_access_cookie(response)
+    clear_two_fa_challenge_cookie(response)
+    _prevent_caching(response)
+
     return OnboardingResumeResponse(
         message="Continue two-factor authentication setup.",
-        onboarding_token=create_onboarding_token(str(user.id)),
     )
-
-
-# ---------------------------------------------------------------------------
-# 2FA setup
-# ---------------------------------------------------------------------------
 
 
 @router.post(
     "/2fa/setup",
     response_model=TwoFASetupResponse,
     status_code=status.HTTP_200_OK,
-    summary="Generate TOTP secret for 2FA setup",
+    summary="Initialize TOTP setup",
 )
 def two_fa_setup(
+    response: Response,
     db: Session = Depends(get_db),
-    current_user: User = Depends(
-        require_onboarding_user
-    )
+    current_user: User = Depends(require_onboarding_user),
 ) -> TwoFASetupResponse:
-    """
-    Step 2 of student onboarding (also usable for 2FA reset).
+    """Create a pending TOTP seed without exposing it in the API response."""
+    setup_2fa(db, current_user)
+    _prevent_caching(response)
+    return TwoFASetupResponse(
+        message="Two-factor authentication setup initialized.",
+        qr_code_url="/api/v1/auth/2fa/qr",
+    )
 
-    Generates a new TOTP secret, stores it on the user record, and
-    returns the QR URI and secret for manual entry.
 
-    The student must scan the QR code and confirm the first code via
-    POST /auth/2fa/confirm before the account becomes active.
-    """
-    return setup_2fa(db, current_user)
+@router.get(
+    "/2fa/qr",
+    status_code=status.HTTP_200_OK,
+    summary="Return the pending TOTP setup QR code",
+    responses={200: {"content": {"image/png": {}}}},
+)
+def two_fa_qr(
+    current_user: User = Depends(require_onboarding_user),
+) -> Response:
+    """Render the pending provisioning URI as a non-cacheable PNG image."""
+    if not current_user.totp_secret:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Two-factor authentication setup has not been initialized.",
+        )
+
+    provisioning_uri = get_totp_uri(
+        current_user.totp_secret,
+        current_user.email,
+    )
+    image = qrcode.make(provisioning_uri)
+    output = BytesIO()
+    image.save(output, format="PNG")
+
+    return Response(
+        content=output.getvalue(),
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.post(
@@ -168,25 +191,19 @@ def two_fa_setup(
     status_code=status.HTTP_200_OK,
     summary="Confirm TOTP setup and activate account",
 )
-
 def two_fa_confirm(
     data: ConfirmTwoFARequest,
+    response: Response,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_onboarding_user),
 ) -> ConfirmTwoFAResponse:
     try:
-        plain_codes = confirm_2fa(
-            db,
-            current_user,
-            data.code,
-        )
-
+        plain_codes = confirm_2fa(db, current_user, data.code)
     except TwoFANotConfiguredError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
-
     except InvalidTwoFACodeError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -197,45 +214,36 @@ def two_fa_confirm(
         str(current_user.id),
         role=current_user.role,
     )
+    set_access_cookie(response, access_token)
+    clear_onboarding_cookie(response)
+    clear_two_fa_challenge_cookie(response)
+    _prevent_caching(response)
 
     return ConfirmTwoFAResponse(
-        message=(
-            "Two-factor authentication enabled. "
-            "Store your recovery codes safely."
-        ),
+        message="Two-factor authentication enabled.",
         recovery_codes=plain_codes,
-        access_token=access_token,
     )
-
-# ---------------------------------------------------------------------------
-# Login — stage 1
-# ---------------------------------------------------------------------------
 
 
 @router.post(
     "/login",
     response_model=LoginResponse,
     status_code=status.HTTP_200_OK,
-    summary="Stage 1 login: verify password and return 2FA challenge token",
+    summary="Stage 1 login: verify password",
 )
 def login(
     data: LoginRequest,
+    response: Response,
     db: Session = Depends(get_db),
 ) -> LoginResponse:
-    """
-    Stage 1 of the two-stage login flow.
-
-    On success, returns a short-lived challenge token.  The client must
-    exchange this for a full access token by completing TOTP verification
-    via POST /auth/2fa/verify.
-    """
+    """Validate credentials and establish the next session cookie."""
     try:
         _user, challenge_token, access_token = verify_login_credentials(
             db,
             str(data.email),
             data.password,
         )
-    except (InvalidCredentialsError,) as exc:
+    except InvalidCredentialsError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid email or password.",
@@ -256,73 +264,84 @@ def login(
             detail=str(exc),
         ) from exc
 
-    if access_token:
-        return LoginResponse(
-            requires_2fa=False,
-            access_token=access_token,
-        )
+    clear_onboarding_cookie(response)
+    _prevent_caching(response)
 
-    return LoginResponse(
-        requires_2fa=True,
-        challenge_token=challenge_token,
-    )
+    if access_token is not None:
+        set_access_cookie(response, access_token)
+        clear_two_fa_challenge_cookie(response)
+        return LoginResponse(requires_2fa=False)
 
+    if challenge_token is None:
+        raise RuntimeError("Authentication service did not issue a session token.")
 
-# ---------------------------------------------------------------------------
-# Login — stage 2 (TOTP / recovery code)
-# ---------------------------------------------------------------------------
+    clear_access_cookie(response)
+    set_two_fa_challenge_cookie(response, challenge_token)
+    return LoginResponse(requires_2fa=True)
 
 
 @router.post(
     "/2fa/verify",
-    response_model=TokenResponse,
+    response_model=AuthenticationResponse,
     status_code=status.HTTP_200_OK,
-    summary="Stage 2 login: verify TOTP code and issue access token",
+    summary="Stage 2 login: verify TOTP or recovery code",
 )
-
 def two_fa_verify(
     data: VerifyTOTPRequest,
+    request: Request,
+    response: Response,
     db: Session = Depends(get_db),
-) -> TokenResponse:
+) -> AuthenticationResponse:
+    challenge_token = request.cookies.get(TWO_FA_CHALLENGE_COOKIE_NAME)
+    if challenge_token is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Two-factor authentication challenge required.",
+        )
+
     try:
         _user, access_token = complete_2fa_login(
             db,
-            data.challenge_token,
+            challenge_token,
             data.code,
         )
-
     except InvalidCredentialsError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=str(exc),
         ) from exc
-
     except InvalidTwoFACodeError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication code.",
         ) from exc
-
     except AccountSuspendedError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(exc),
         ) from exc
-
     except TwoFANotConfiguredError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(exc),
         ) from exc
 
-    return TokenResponse(
-        access_token=access_token,
-    )
+    set_access_cookie(response, access_token)
+    clear_two_fa_challenge_cookie(response)
+    _prevent_caching(response)
+    return AuthenticationResponse(message="Authentication successful.")
 
 
-# ---------------------------------------------------------------------------
-# Current user
-# ---------------------------------------------------------------------------
+@router.post(
+    "/logout",
+    response_model=AuthenticationResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Clear all authentication sessions",
+)
+def logout(response: Response) -> AuthenticationResponse:
+    clear_all_auth_cookies(response)
+    _prevent_caching(response)
+    return AuthenticationResponse(message="Logged out successfully.")
 
 
 @router.get(
@@ -332,11 +351,9 @@ def two_fa_verify(
     summary="Return current authenticated user profile",
 )
 def me(
+    response: Response,
     current_user: User = Depends(require_authenticated_user),
 ) -> UserResponse:
-    """
-    Return the profile of the currently authenticated user.
-
-    Never exposes password_hash, totp_secret, or raw tokens.
-    """
+    """Return the current profile without exposing authentication secrets."""
+    _prevent_caching(response)
     return UserResponse.model_validate(current_user)

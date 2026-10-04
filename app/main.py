@@ -4,7 +4,7 @@ DLIF Platform FastAPI application entry point.
 
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
@@ -48,6 +48,15 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept"],
 )
+
+
+@app.middleware("http")
+async def prevent_auth_response_caching(request: Request, call_next):
+    """Keep authentication responses, including errors, out of caches."""
+    response = await call_next(request)
+    if request.url.path.startswith("/api/v1/auth/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 # ---------------------------------------------------------------------------

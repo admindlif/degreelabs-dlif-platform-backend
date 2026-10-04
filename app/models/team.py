@@ -15,7 +15,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, backref, mapped_column, relationship
 
 from app.db.base import Base
 
@@ -195,7 +195,11 @@ class TeamMembership(Base):
 
     user = relationship(
         "User",
-        backref="team_memberships",
+        backref=backref(
+            "team_memberships",
+            cascade="all, delete-orphan",
+            passive_deletes=True,
+        ),
     )
 
 

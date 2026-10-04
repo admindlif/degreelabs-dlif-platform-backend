@@ -16,16 +16,18 @@ Usage in route functions:
         ...
 
 Authorization is enforced server-side for every protected endpoint.
-Clients must pass a valid Bearer token in the Authorization header.
+Clients authenticate with the HttpOnly access cookie.  Bearer tokens remain
+supported as a temporary compatibility fallback for existing API consumers.
 """
 
 import logging
 from typing import Annotated
 
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from app.core.auth_cookies import ACCESS_COOKIE_NAME, ONBOARDING_COOKIE_NAME
 from app.core.security import (
     decode_access_token,
     decode_onboarding_token,
@@ -49,14 +51,14 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _extract_user_id_from_token(
-    credentials: HTTPAuthorizationCredentials | None,
+    token: str | None,
 ) -> str:
     """
-    Validate the Bearer token and return the user ID (``sub`` claim).
+    Validate an access token and return the user ID (``sub`` claim).
 
     Raises HTTP 401 for missing or invalid tokens.
     """
-    if credentials is None:
+    if token is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required.",
@@ -64,7 +66,7 @@ def _extract_user_id_from_token(
         )
 
     try:
-        payload = decode_access_token(credentials.credentials)
+        payload = decode_access_token(token)
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -82,9 +84,9 @@ def _extract_user_id_from_token(
 
 
 def _extract_onboarding_user_id_from_token(
-    credentials: HTTPAuthorizationCredentials | None,
+    token: str | None,
 ) -> str:
-    if credentials is None:
+    if token is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Onboarding authentication required.",
@@ -92,9 +94,7 @@ def _extract_onboarding_user_id_from_token(
         )
 
     try:
-        payload = decode_onboarding_token(
-            credentials.credentials
-        )
+        payload = decode_onboarding_token(token)
     except jwt.ExpiredSignatureError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -108,11 +108,9 @@ def _extract_onboarding_user_id_from_token(
 
     return payload["sub"]
 
+
 def require_onboarding_user(
-    credentials: Annotated[
-        HTTPAuthorizationCredentials | None,
-        Depends(_bearer_scheme),
-    ],
+    request: Request,
     db: Session = Depends(get_db),
 ) -> User:
     """
@@ -121,7 +119,7 @@ def require_onboarding_user(
     """
 
     user_id_str = _extract_onboarding_user_id_from_token(
-        credentials
+        request.cookies.get(ONBOARDING_COOKIE_NAME)
     )
 
     try:
@@ -172,6 +170,7 @@ def require_onboarding_user(
 
 
 def require_authenticated_user(
+    request: Request,
     credentials: Annotated[
         HTTPAuthorizationCredentials | None,
         Depends(_bearer_scheme),
@@ -181,11 +180,16 @@ def require_authenticated_user(
     """
     FastAPI dependency that returns the current authenticated user.
 
-    - Validates the Bearer token.
+    - Prefers the HttpOnly access cookie.
+    - Accepts a Bearer token as a compatibility fallback.
     - Loads the user from the database.
     - Rejects suspended or inactive accounts.
     """
-    user_id_str = _extract_user_id_from_token(credentials)
+    token = request.cookies.get(ACCESS_COOKIE_NAME)
+    if token is None and credentials is not None:
+        token = credentials.credentials
+
+    user_id_str = _extract_user_id_from_token(token)
 
     try:
         user_id = UUID(user_id_str)

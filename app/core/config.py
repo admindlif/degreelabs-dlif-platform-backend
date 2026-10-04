@@ -26,6 +26,12 @@ class Settings(BaseSettings):
 
     onboarding_token_expire_minutes: int = Field(default=20, gt=0)
 
+    # Authentication cookies.  ``None`` makes Secure follow the environment:
+    # enabled in production and disabled for local HTTP development.
+    auth_cookie_secure: bool | None = None
+    auth_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    auth_cookie_domain: str | None = None
+
     # Frontend
     frontend_base_url: str = Field(min_length=1)
     cors_allowed_origins: str | None = None
@@ -80,6 +86,22 @@ class Settings(BaseSettings):
             )
         )
 
+    @property
+    def is_production(self) -> bool:
+        return self.environment.strip().lower() == "production"
+
+    @property
+    def effective_auth_cookie_secure(self) -> bool:
+        if self.auth_cookie_secure is not None:
+            return self.auth_cookie_secure
+        return self.is_production
+
+    @property
+    def effective_auth_cookie_domain(self) -> str | None:
+        if self.auth_cookie_domain is None:
+            return None
+        return self.auth_cookie_domain.strip() or None
+
     @model_validator(mode="after")
     def validate_security_configuration(self) -> "Settings":
         if not self.database_url.strip():
@@ -101,7 +123,7 @@ class Settings(BaseSettings):
             ):
                 raise ValueError(f"{label} must contain valid HTTP(S) origins.")
 
-        is_production = self.environment.strip().lower() == "production"
+        is_production = self.is_production
         if is_production:
             if self.email_backend != "smtp":
                 raise ValueError("EMAIL_BACKEND must be 'smtp' in production.")
@@ -110,6 +132,16 @@ class Settings(BaseSettings):
                 for origin in self.allowed_origins
             ):
                 raise ValueError("Production CORS origins cannot target localhost.")
+            if not self.effective_auth_cookie_secure:
+                raise ValueError("AUTH_COOKIE_SECURE must be true in production.")
+
+        if (
+            self.auth_cookie_samesite == "none"
+            and not self.effective_auth_cookie_secure
+        ):
+            raise ValueError(
+                "AUTH_COOKIE_SAMESITE='none' requires AUTH_COOKIE_SECURE=true."
+            )
 
         if self.email_backend == "smtp" and not (
             self.smtp_username and self.smtp_password

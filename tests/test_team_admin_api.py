@@ -2,6 +2,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone
 
@@ -265,6 +266,45 @@ def test_admin_add_fellow_to_team(
             users=[fellow],
             programs=[program],
         )
+
+
+def test_admin_delete_fellow_removes_team_membership(
+    client: TestClient,
+    admin_headers: dict[str, str],
+    db: Session,
+):
+    program = create_program(db)
+    cohort = create_cohort(db, program, "DELETE-FELLOW")
+    fellow = create_fellow(db, cohort, "delete-member")
+    team = create_team(db, cohort)
+    membership = TeamMembership(
+        team_id=team.id,
+        cohort_id=cohort.id,
+        user_id=fellow.id,
+        team_role=TeamMemberRole.MEMBER,
+    )
+    db.add(membership)
+    db.commit()
+    membership_id = membership.id
+    fellow_id = fellow.id
+
+    try:
+        response = client.delete(
+            f"/api/v1/admin/fellows/{fellow_id}",
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 204
+        db.expire_all()
+        assert db.get(User, fellow_id) is None
+        assert db.scalar(
+            select(TeamMembership).where(TeamMembership.id == membership_id)
+        ) is None
+        assert db.scalar(
+            select(Enrollment).where(Enrollment.user_id == fellow_id)
+        ) is None
+    finally:
+        cleanup(db, programs=[program])
 
 
 def test_admin_cannot_add_fellow_to_team_in_wrong_cohort(

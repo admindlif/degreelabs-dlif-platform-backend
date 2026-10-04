@@ -21,7 +21,6 @@ from app.core.security import (
     create_access_token,
     decode_2fa_challenge_token,
     generate_totp_secret,
-    get_totp_uri,
     hash_invitation_token,
     hash_password,
     verify_password,
@@ -47,8 +46,6 @@ from app.schemas.auth import (
     ActivateAccountRequest,
     CreateFellowRequest,
     CreateStudentRequest,
-    TwoFASetupResponse,
-    VerifyTOTPRequest,
 )
 from app.services.invitation import create_invitation_for_user
 
@@ -265,27 +262,16 @@ def resume_onboarding(
 def setup_2fa(
     db: Session,
     user: User,
-) -> "TwoFASetupResponse":
+) -> None:
     """
-    Generate a new TOTP secret for the user and return the QR URI.
+    Generate and persist a new pending TOTP secret for the user.
 
     The secret is stored immediately on the user record so it can be
     confirmed in the next step.  ``two_factor_enabled`` remains ``False``
     until the first code is successfully verified.
     """
-    secret = generate_totp_secret()
-    uri = get_totp_uri(secret, user.email)
-
-    user.totp_secret = secret
+    user.totp_secret = generate_totp_secret()
     db.commit()
-
-    return TwoFASetupResponse(
-        totp_uri=uri,
-        # Return the secret as a plain string for manual entry in apps
-        # that don't support QR scanning.  This is the only point it is
-        # ever exposed outside the database.
-        secret=secret,
-    )
 
 
 def confirm_2fa(

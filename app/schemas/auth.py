@@ -69,8 +69,6 @@ class ActivateAccountResponse(BaseModel):
     message: str
     user_id: UUID
     email: EmailStr
-    onboarding_token: str
-    token_type: str = "bearer"
 
 
 class OnboardingResumeRequest(BaseModel):
@@ -80,8 +78,6 @@ class OnboardingResumeRequest(BaseModel):
 
 class OnboardingResumeResponse(BaseModel):
     message: str
-    onboarding_token: str
-    token_type: str = "bearer"
 
 
 # ---------------------------------------------------------------------------
@@ -90,15 +86,8 @@ class OnboardingResumeResponse(BaseModel):
 
 
 class TwoFASetupResponse(BaseModel):
-    """
-    Returned after POST /auth/2fa/setup.
-
-    ``totp_uri`` is for QR code generation.
-    ``secret`` is for manual entry in authenticator apps.
-    """
-
-    totp_uri: str
-    secret: str
+    message: str
+    qr_code_url: str
 
 
 class ConfirmTwoFARequest(BaseModel):
@@ -108,8 +97,6 @@ class ConfirmTwoFARequest(BaseModel):
 class ConfirmTwoFAResponse(BaseModel):
     message: str
     recovery_codes: list[str]
-    access_token: str
-    token_type: str = "bearer"
 
 
 # ---------------------------------------------------------------------------
@@ -123,27 +110,15 @@ class LoginRequest(BaseModel):
 
 
 class LoginResponse(BaseModel):
-    """
-    Returned after successful password verification.
-
-    ``requires_2fa=True`` means the client must post the TOTP code to
-    /auth/2fa/verify with the ``challenge_token``.
-    If ``requires_2fa=False``, ``access_token`` is provided directly.
-    """
-
     requires_2fa: bool
-    challenge_token: str | None = None
-    access_token: str | None = None
 
 
 class VerifyTOTPRequest(BaseModel):
-    challenge_token: str
     code: str = Field(min_length=6, max_length=10)
 
 
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
+class AuthenticationResponse(BaseModel):
+    message: str
 
 
 # ---------------------------------------------------------------------------
