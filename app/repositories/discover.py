@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from uuid import UUID
 from sqlalchemy import asc, select
 from sqlalchemy.orm import Session, joinedload
@@ -73,14 +74,20 @@ def get_next_session_for_cohort(
     if live_session:
         return live_session
 
-    # 2. Otherwise find the first SCHEDULED session
+    # 2. Otherwise find the next SCHEDULED session that has not ended
+    now = datetime.now(timezone.utc)
+
     sched_stmt = (
         select(DBSession)
         .where(
             DBSession.cohort_id == cohort_id,
             DBSession.phase_id == phase_id,
             DBSession.status == SessionStatus.SCHEDULED,
+            DBSession.end_at > now,
         )
-        .order_by(asc(DBSession.sequence))
+        .order_by(
+            asc(DBSession.start_at),
+            asc(DBSession.sequence),
+        )
     )
     return db.scalars(sched_stmt).first()
