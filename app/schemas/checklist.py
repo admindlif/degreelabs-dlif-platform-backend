@@ -110,3 +110,19 @@ class FellowChecklistResponse(BaseModel):
 
 class ChecklistCompletionUpdate(BaseModel):
     is_completed: bool
+
+
+class ChecklistReminderItem(BaseModel):
+    id: UUID
+    title: str
+    message: str
+    status: ChecklistStatus
+    due_at: datetime
+    target_url: str = "/notifications"
+
+    model_config = {"from_attributes": True}
+
+
+class ChecklistRemindersResponse(BaseModel):
+    total_count: int
+    reminders: list[ChecklistReminderItem]

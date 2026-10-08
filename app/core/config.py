@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     smtp_username: str | None = None
     smtp_password: str | None = None
     smtp_use_tls: bool = True
+    email_logo_url: str | None = None
 
 
     # Google Meet
