@@ -123,6 +123,13 @@ If you weren't expecting this invitation, please contact your programme administ
 The DegreeLabs Team
 """
 
+    logo_url = settings.email_logo_url
+    if not logo_url:
+        if settings.frontend_base_url.startswith("https://"):
+            logo_url = f"{settings.frontend_base_url.rstrip('/')}/degreelabs-logo.png"
+        else:
+            logo_url = "https://framerusercontent.com/images/wQtZcQz0JelTmeZro2xPdEUWPwI.png"
+
     html_body = f"""\
 <!DOCTYPE html>
 <html lang="en">
@@ -138,10 +145,12 @@ The DegreeLabs Team
                style="background:#ffffff;border:1px solid #e5e5e5;border-radius:8px;overflow:hidden;">
           <!-- Header -->
           <tr>
-            <td style="background:#0f172a;padding:32px 40px;">
-              <p style="margin:0;font-size:20px;font-weight:700;color:#ffffff;letter-spacing:-0.3px;">
-                DegreeLabs
-              </p>
+            <td style="background:#ffffff;padding:32px 40px 24px;border-bottom:1px solid #f3f4f6;">
+              <img src="{logo_url}"
+                   alt="DegreeLabs"
+                   width="150"
+                   height="32"
+                   style="display:block;width:150px;max-width:150px;height:auto;border:0;outline:none;text-decoration:none;" />
             </td>
           </tr>
           <!-- Body -->

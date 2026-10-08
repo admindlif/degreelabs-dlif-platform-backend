@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -16,6 +16,8 @@ from app.repositories.enrollment import get_active_enrollment_for_user
 from app.schemas.checklist import (
     ChecklistItemCreate,
     ChecklistItemUpdate,
+    ChecklistReminderItem,
+    ChecklistRemindersResponse,
     ChecklistSummaryResponse,
     FellowChecklistItemResponse,
     FellowChecklistResponse,
@@ -162,6 +164,81 @@ def get_fellow_checklist(
             percentage=percentage,
         ),
         items=items,
+    )
+
+
+def get_fellow_checklist_reminders(
+    db: Session,
+    current_user: User,
+) -> ChecklistRemindersResponse:
+    cohort_id, phase_id = _fellow_scope(db, current_user)
+    rows = db.execute(
+        select(ChecklistItem, FellowChecklistCompletion)
+        .outerjoin(
+            FellowChecklistCompletion,
+            (FellowChecklistCompletion.checklist_item_id == ChecklistItem.id)
+            & (FellowChecklistCompletion.user_id == current_user.id),
+        )
+        .where(*_visibility_conditions(cohort_id, phase_id))
+        .order_by(
+            ChecklistItem.sequence,
+            ChecklistItem.due_at.asc().nulls_last(),
+            ChecklistItem.created_at,
+        )
+    ).all()
+
+    now = datetime.now(timezone.utc)
+    upcoming_limit = now + timedelta(hours=48)
+
+    eligible_reminders: list[tuple[int, datetime, int, ChecklistReminderItem]] = []
+
+    for item, completion in rows:
+        status_val = _status_for(item, completion, now)
+
+        # Exclude completed items
+        if status_val == "completed":
+            continue
+
+        # Undated items are excluded from reminders
+        if item.due_at is None:
+            continue
+
+        due_at = (
+            item.due_at
+            if item.due_at.tzinfo is not None
+            else item.due_at.replace(tzinfo=timezone.utc)
+        )
+
+        if status_val == "overdue":
+            message = "This checklist item is overdue."
+            sort_priority = 0
+        elif status_val == "pending" and due_at <= upcoming_limit:
+            message = "This checklist item is due soon."
+            sort_priority = 1
+        else:
+            continue
+
+        reminder_item = ChecklistReminderItem(
+            id=item.id,
+            title=item.title,
+            message=message,
+            status=status_val,
+            due_at=due_at,
+            target_url="/notifications",
+        )
+        eligible_reminders.append(
+            (sort_priority, due_at, item.sequence, reminder_item)
+        )
+
+    # Order overdue reminders first, then upcoming reminders by deadline
+    eligible_reminders.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
+
+    total_count = len(eligible_reminders)
+    reminders = [entry[3] for entry in eligible_reminders[:5]]
+
+    return ChecklistRemindersResponse(
+        total_count=total_count,
+        reminders=reminders,
     )
 
 

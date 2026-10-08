@@ -45,11 +45,13 @@ from app.schemas.feedback import SubmissionFeedbackDetail
 from app.services.feedback import get_fellow_session_feedback
 from app.schemas.checklist import (
     ChecklistCompletionUpdate,
+    ChecklistRemindersResponse,
     FellowChecklistItemResponse,
     FellowChecklistResponse,
 )
 from app.services.checklist import (
     get_fellow_checklist,
+    get_fellow_checklist_reminders,
     update_fellow_checklist_completion,
 )
 router = APIRouter(prefix="/fellow", tags=["Fellow Portal"])
@@ -264,6 +266,18 @@ def get_checklist(
     db: Session = Depends(get_db),
 ) -> FellowChecklistResponse:
     return get_fellow_checklist(db, current_user)
+
+
+@router.get(
+    "/checklist-reminders",
+    response_model=ChecklistRemindersResponse,
+    summary="Get authenticated Fellow's actionable checklist reminders",
+)
+def get_checklist_reminders(
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> ChecklistRemindersResponse:
+    return get_fellow_checklist_reminders(db, current_user)
 
 
 @router.put(
