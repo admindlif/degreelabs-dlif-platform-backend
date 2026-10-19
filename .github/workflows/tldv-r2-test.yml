@@ -1,0 +1,105 @@
+name: DLIF R2 Upload Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - test/tldv-r2-upload
+    paths:
+      - .github/workflows/tldv-r2-test.yml
+
+permissions: {}
+
+jobs:
+  test-r2-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install boto3
+        run: python -m pip install boto3
+
+      - name: Test R2 upload speed
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+
+        run: |
+          python - <<'PY'
+          import os
+          import time
+          import uuid
+          import boto3
+          from botocore.config import Config
+
+          names = [
+              "R2_ACCOUNT_ID",
+              "R2_ACCESS_KEY_ID",
+              "R2_SECRET_ACCESS_KEY",
+              "R2_BUCKET_NAME",
+          ]
+
+          for name in names:
+              if not os.getenv(name):
+                  raise SystemExit(f"Missing GitHub secret: {name}")
+
+          client = boto3.client(
+              "s3",
+              endpoint_url=(
+                  f"https://{os.environ['R2_ACCOUNT_ID']}"
+                  ".r2.cloudflarestorage.com"
+              ),
+              aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+              aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+              region_name="auto",
+              config=Config(
+                  connect_timeout=15,
+                  read_timeout=60,
+                  retries={"max_attempts": 2},
+              ),
+          )
+
+          bucket = os.environ["R2_BUCKET_NAME"]
+          key = f"tests/github-actions/{uuid.uuid4()}.bin"
+          data = os.urandom(1024 * 1024)
+
+          uploaded = False
+
+          try:
+              start = time.perf_counter()
+
+              client.put_object(
+                  Bucket=bucket,
+                  Key=key,
+                  Body=data,
+                  ContentType="application/octet-stream",
+              )
+              uploaded = True
+
+              seconds = time.perf_counter() - start
+
+              result = client.head_object(
+                  Bucket=bucket,
+                  Key=key,
+              )
+
+              if result["ContentLength"] != len(data):
+                  raise RuntimeError("Upload size mismatch")
+
+              print("R2 upload successful")
+              print(f"File size: {len(data)} bytes")
+              print(f"Upload time: {seconds:.2f} seconds")
+              print(f"Speed: {len(data)/1024/1024/seconds:.2f} MiB/s")
+
+          finally:
+              if uploaded:
+                  client.delete_object(Bucket=bucket, Key=key)
+                  print("Test object deleted")
+          PY
