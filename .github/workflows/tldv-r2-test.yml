@@ -68,7 +68,7 @@ jobs:
 
           bucket = os.environ["R2_BUCKET_NAME"]
           key = f"tests/github-actions/{uuid.uuid4()}.bin"
-          data = os.urandom(1024 * 1024)
+          data = os.urandom(32 * 1024 * 1024)
 
           uploaded = False
 
