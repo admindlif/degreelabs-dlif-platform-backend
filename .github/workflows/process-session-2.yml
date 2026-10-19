@@ -1,0 +1,125 @@
+# .github/workflows/process-session-2.yml
+#
+# Transfers the DLIF Session 2 recording from tl;dv to Cloudflare R2.
+#
+# Constraints:
+#   - No DATABASE_URL secret is used.
+#   - No Supabase / PostgreSQL mutations are performed here.
+#   - The workflow is idempotent: if the R2 object already exists the job exits 0.
+#   - All logs are sanitised: signed URLs and API keys are never printed.
+#
+# After the workflow succeeds, run process_session_recording_to_r2 locally
+# (< 1 second) to update the Supabase sessions table (status -> READY).
+
+name: Process Session 2 — tl;dv to R2
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: "DLIF session UUID"
+        required: true
+        default: "2b27b883-d215-4530-8df9-340b74024b87"
+      tldv_meeting_id:
+        description: "tl;dv meeting ID"
+        required: true
+        default: "6ab67739571e2f00130d01b6"
+      min_duration_seconds:
+        description: "Minimum accepted duration (seconds)"
+        required: false
+        default: "5000"
+      dry_run:
+        description: "Dry run (no downloads/uploads)"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  transfer:
+    name: Transfer recording to R2
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # R2 credentials — stored as GitHub Actions secrets, never in code.
+      R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+      TLDV_API_KEY:         ${{ secrets.TLDV_API_KEY }}
+
+      # Script parameters
+      SESSION_ID:           ${{ inputs.session_id }}
+      TLDV_MEETING_ID:      ${{ inputs.tldv_meeting_id }}
+      MIN_DURATION:         ${{ inputs.min_duration_seconds }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install boto3 botocore
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - name: Validate secrets present
+        run: |
+          missing=""
+          for var in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET_NAME TLDV_API_KEY; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Secret $var is not set"
+              missing="$missing $var"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing secrets:$missing"
+            exit 1
+          fi
+          echo "All required secrets are present."
+
+      - name: Syntax check
+        run: python -m py_compile scripts/transfer_session_to_r2.py && echo "Syntax OK"
+
+      - name: Dry-run validation
+        if: ${{ inputs.dry_run == true || inputs.dry_run == 'true' }}
+        run: |
+          python scripts/transfer_session_to_r2.py \
+            --session-id "$SESSION_ID" \
+            --tldv-meeting-id "$TLDV_MEETING_ID" \
+            --min-duration-seconds "$MIN_DURATION" \
+            --dry-run
+
+      - name: Transfer recording to R2
+        if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' }}
+        run: |
+          python scripts/transfer_session_to_r2.py \
+            --session-id "$SESSION_ID" \
+            --tldv-meeting-id "$TLDV_MEETING_ID" \
+            --min-duration-seconds "$MIN_DURATION"
+
+      - name: Remind operator of next step
+        if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' }}
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "  Transfer complete."
+          echo "  R2 object: recordings/$SESSION_ID/recording.mp4"
+          echo ""
+          echo "  NEXT STEP (run locally — not in CI):"
+          echo "  python -c \"from app.services.tldv import process_session_recording_to_r2; ..."
+          echo "  This updates the Supabase sessions table (status -> READY)."
+          echo "  No DATABASE_URL is required in GitHub Actions."
+          echo "=========================================="
