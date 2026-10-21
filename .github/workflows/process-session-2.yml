@@ -32,7 +32,7 @@ on:
         description: "Dry run (no downloads/uploads)"
         type: boolean
         required: false
-        default: true
+        default: false
   push:
     branches:
       - test/tldv-r2-upload
@@ -58,7 +58,7 @@ jobs:
       SESSION_ID:           ${{ inputs.session_id || '2b27b883-d215-4530-8df9-340b74024b87' }}
       TLDV_MEETING_ID:      ${{ inputs.tldv_meeting_id || '6ab67739571e2f00130d01b6' }}
       MIN_DURATION:         ${{ inputs.min_duration_seconds || '5000' }}
-      DRY_RUN:              ${{ inputs.dry_run != '' && inputs.dry_run || 'true' }}
+      DRY_RUN:              ${{ inputs.dry_run == true && 'true' || 'false' }}
 
     steps:
       - name: Checkout repository
