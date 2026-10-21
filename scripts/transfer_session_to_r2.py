@@ -48,9 +48,8 @@ def _sanitize(text: str) -> str:
 
 class SanitizingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:  # noqa: A003
-        record.msg = _sanitize(str(record.msg))
-        record.args = None  # prevent %-formatting of raw args into log
-        return super().format(record)
+        formatted = super().format(record)
+        return _sanitize(formatted)
 
 
 def _setup_logging() -> logging.Logger:
@@ -295,6 +294,14 @@ def run_transfer(
     min_duration_seconds: int,
     dry_run: bool,
 ) -> None:
+    if (
+        session_id != "2b27b883-d215-4530-8df9-340b74024b87"
+        or tldv_meeting_id != "6ab67739571e2f00130d01b6"
+    ):
+        raise SystemExit(
+            "Safety check failed: only Session 2 is permitted."
+        )
+
     bucket = _require_env("R2_BUCKET_NAME")
     object_key = f"{R2_OBJECT_PREFIX}/{session_id}/recording.mp4"
 

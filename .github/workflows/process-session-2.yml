@@ -8,7 +8,7 @@
 #   - The workflow is idempotent: if the R2 object already exists the job exits 0.
 #   - All logs are sanitised: signed URLs and API keys are never printed.
 #
-# After the workflow succeeds, run process_session_recording_to_r2 locally
+# After the workflow succeeds, run process_single_recording.py locally
 # (< 1 second) to update the Supabase sessions table (status -> READY).
 
 name: Process Session 2 — tl;dv to R2
@@ -32,7 +32,13 @@ on:
         description: "Dry run (no downloads/uploads)"
         type: boolean
         required: false
-        default: false
+        default: true
+  push:
+    branches:
+      - test/tldv-r2-upload
+    paths:
+      - .github/workflows/process-session-2.yml
+      - scripts/transfer_session_to_r2.py
 
 jobs:
   transfer:
@@ -48,10 +54,11 @@ jobs:
       R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
       TLDV_API_KEY:         ${{ secrets.TLDV_API_KEY }}
 
-      # Script parameters
-      SESSION_ID:           ${{ inputs.session_id }}
-      TLDV_MEETING_ID:      ${{ inputs.tldv_meeting_id }}
-      MIN_DURATION:         ${{ inputs.min_duration_seconds }}
+      # Script parameters (with fallbacks for push events)
+      SESSION_ID:           ${{ inputs.session_id || '2b27b883-d215-4530-8df9-340b74024b87' }}
+      TLDV_MEETING_ID:      ${{ inputs.tldv_meeting_id || '6ab67739571e2f00130d01b6' }}
+      MIN_DURATION:         ${{ inputs.min_duration_seconds || '5000' }}
+      DRY_RUN:              ${{ inputs.dry_run != '' && inputs.dry_run || 'true' }}
 
     steps:
       - name: Checkout repository
@@ -94,24 +101,17 @@ jobs:
         run: python -m py_compile scripts/transfer_session_to_r2.py && echo "Syntax OK"
 
       - name: Dry-run validation
-        if: ${{ inputs.dry_run == true || inputs.dry_run == 'true' }}
+        if: ${{ env.DRY_RUN == 'true' || env.DRY_RUN == true }}
         run: |
-          python scripts/transfer_session_to_r2.py \
-            --session-id "$SESSION_ID" \
-            --tldv-meeting-id "$TLDV_MEETING_ID" \
-            --min-duration-seconds "$MIN_DURATION" \
-            --dry-run
+          python scripts/transfer_session_to_r2.py             --session-id "$SESSION_ID"             --tldv-meeting-id "$TLDV_MEETING_ID"             --min-duration-seconds "$MIN_DURATION"             --dry-run
 
       - name: Transfer recording to R2
-        if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' }}
+        if: ${{ env.DRY_RUN != 'true' && env.DRY_RUN != true }}
         run: |
-          python scripts/transfer_session_to_r2.py \
-            --session-id "$SESSION_ID" \
-            --tldv-meeting-id "$TLDV_MEETING_ID" \
-            --min-duration-seconds "$MIN_DURATION"
+          python scripts/transfer_session_to_r2.py             --session-id "$SESSION_ID"             --tldv-meeting-id "$TLDV_MEETING_ID"             --min-duration-seconds "$MIN_DURATION"
 
       - name: Remind operator of next step
-        if: ${{ inputs.dry_run != true && inputs.dry_run != 'true' }}
+        if: ${{ env.DRY_RUN != 'true' && env.DRY_RUN != true }}
         run: |
           echo ""
           echo "=========================================="
@@ -119,7 +119,7 @@ jobs:
           echo "  R2 object: recordings/$SESSION_ID/recording.mp4"
           echo ""
           echo "  NEXT STEP (run locally — not in CI):"
-          echo "  python -c \"from app.services.tldv import process_session_recording_to_r2; ..."
+          echo "  python scripts/process_single_recording.py --session-id $SESSION_ID --execute"
           echo "  This updates the Supabase sessions table (status -> READY)."
           echo "  No DATABASE_URL is required in GitHub Actions."
           echo "=========================================="
