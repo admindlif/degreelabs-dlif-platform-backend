@@ -17,6 +17,22 @@ import os
 import re
 from uuid import UUID
 
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+    SSLError,
+)
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+    SSLError,
+)
 from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal
@@ -63,6 +79,90 @@ def _sanitize_error_message(err: str) -> str:
     if len(sanitized) > 300:
         sanitized = sanitized[:300]
     return sanitized.strip()
+
+
+def _is_retryable_processing_error(exc: BaseException) -> bool:
+    """
+    Return True for transient network / R2 errors that should be retried
+    automatically by a later recording-processing batch.
+    """
+    retryable_types = (
+        ConnectionClosedError,
+        ConnectTimeoutError,
+        EndpointConnectionError,
+        ReadTimeoutError,
+        SSLError,
+    )
+
+    retryable_client_codes = {
+        "RequestTimeout",
+        "RequestTimeoutException",
+        "SlowDown",
+        "Throttling",
+        "ThrottlingException",
+        "InternalError",
+        "InternalServerError",
+        "ServiceUnavailable",
+    }
+
+    retryable_http_statuses = {
+        408,
+        429,
+        500,
+        502,
+        503,
+        504,
+    }
+
+    retryable_message_markers = (
+        "temporary failure in name resolution",
+        "unexpected_eof_while_reading",
+        "connection reset",
+        "connection aborted",
+        "connection closed",
+        "remote end closed connection",
+        "timed out",
+        "timeout",
+    )
+
+    current: BaseException | None = exc
+    seen: set[int] = set()
+
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+
+        if isinstance(current, retryable_types):
+            return True
+
+        if isinstance(current, ClientError):
+            response = current.response or {}
+
+            error_code = str(
+                response.get("Error", {}).get("Code", "")
+            )
+
+            http_status = (
+                response.get("ResponseMetadata", {})
+                .get("HTTPStatusCode")
+            )
+
+            if (
+                error_code in retryable_client_codes
+                or http_status in retryable_http_statuses
+            ):
+                return True
+
+        message = str(current).lower()
+
+        if any(
+            marker in message
+            for marker in retryable_message_markers
+        ):
+            return True
+
+        current = current.__cause__ or current.__context__
+
+    return False
 
 
 def _cleanup_temp_files(session_id: UUID, seekable_file: str | None = None) -> None:
@@ -292,26 +392,48 @@ def _execute_processing(session_id: UUID, db: Session) -> RecordingProcessingRes
         except Exception as exc:
             # 12. Failure handling
             safe_error = _sanitize_error_message(str(exc))
-            logger.exception(
-                "Recording processing failed for session %s: %s",
-                session.id,
-                safe_error,
-            )
-            session.recording_processing_status = RecordingProcessingStatus.FAILED
+            retryable = _is_retryable_processing_error(exc)
+
+            if retryable:
+                next_status = RecordingProcessingStatus.PENDING
+
+                logger.warning(
+                    "Transient recording processing error for session %s; "
+                    "returning to PENDING for automatic retry: %s",
+                    session.id,
+                    safe_error,
+                )
+            else:
+                next_status = RecordingProcessingStatus.FAILED
+
+                logger.exception(
+                    "Recording processing failed for session %s: %s",
+                    session.id,
+                    safe_error,
+                )
+
+            session.recording_processing_status = next_status
             session.recording_processing_error = safe_error
+
             try:
                 db.commit()
                 db.refresh(session)
             except Exception as commit_exc:
                 logger.exception(
-                    "Failed to commit FAILED status for session %s: %s",
+                    "Failed to commit %s status for session %s: %s",
+                    next_status.value,
                     session.id,
                     commit_exc,
                 )
 
             return RecordingProcessingResult(
                 session_id=session.id,
-                status=RecordingProcessingStatus.FAILED,
+                status=next_status,
+                detail=(
+                    "Transient processing error; recording will be retried automatically."
+                    if retryable
+                    else None
+                ),
                 error=safe_error,
             )
 

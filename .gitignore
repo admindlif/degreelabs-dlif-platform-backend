@@ -63,3 +63,5 @@ temp/
 # Operating system
 .DS_Store
 Thumbs.db
+# WSL Python virtual environment
+.venv-wsl/

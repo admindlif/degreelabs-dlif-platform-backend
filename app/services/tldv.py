@@ -73,12 +73,24 @@ class TLDVTranscriptData(BaseModel):
     full_text: str | None = None
 
 
+
+class TLDVMeetingData(BaseModel):
+    meeting_id: str
+    name: str
+    happened_at: str | None = None
+    duration_seconds: int | None = None
+    conference_id: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Client Protocol and Implementations
 # ---------------------------------------------------------------------------
 
 
 class TLDVClient(Protocol):
+    def list_meetings(self) -> list[TLDVMeetingData]:
+        ...
+
     def get_recording_playback(self, meeting_id: str) -> TLDVPlaybackData:
         ...
 
@@ -91,6 +103,9 @@ class MockTLDVClient:
     Mock client for local development and test automation.
     Activated only when settings.tldv_mock_mode is explicitly True.
     """
+
+    def list_meetings(self) -> list[TLDVMeetingData]:
+        return []
 
     def get_recording_playback(self, meeting_id: str) -> TLDVPlaybackData:
         return TLDVPlaybackData(
@@ -147,6 +162,77 @@ class HttpTLDVClient:
             "Accept": "application/json",
             "User-Agent": "DLIF-Platform-Backend/1.0",
         }
+
+    def list_meetings(self) -> list[TLDVMeetingData]:
+        meetings: list[TLDVMeetingData] = []
+        page = 1
+
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                while True:
+                    response = client.get(
+                        f"{self.base_url}/v1alpha1/meetings",
+                        headers=self._headers(),
+                        params={
+                            "page": page,
+                            "limit": 100,
+                        },
+                    )
+
+                    response.raise_for_status()
+                    payload = response.json()
+
+                    results = payload.get("results") or []
+
+                    for item in results:
+                        if not isinstance(item, dict):
+                            continue
+
+                        meeting_id = item.get("id")
+                        name = item.get("name")
+
+                        if not meeting_id or not name:
+                            continue
+
+                        raw_duration = item.get("duration")
+                        duration_seconds = None
+
+                        if raw_duration is not None:
+                            try:
+                                duration_seconds = int(
+                                    round(float(raw_duration))
+                                )
+                            except (TypeError, ValueError):
+                                duration_seconds = None
+
+                        extra = item.get("extraProperties") if isinstance(item.get("extraProperties"), dict) else {}
+                        conference_id = extra.get("conferenceId") or item.get("conferenceId")
+
+                        meetings.append(
+                            TLDVMeetingData(
+                                meeting_id=str(meeting_id),
+                                name=str(name),
+                                happened_at=item.get("happenedAt"),
+                                duration_seconds=duration_seconds,
+                                conference_id=str(conference_id) if conference_id else None,
+                            )
+                        )
+
+                    total_pages = payload.get("pages") or page
+
+                    if not results or page >= int(total_pages):
+                        break
+
+                    page += 1
+
+            return meetings
+
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            logger.error(
+                "HTTP request error listing tl;dv meetings: %s",
+                type(exc).__name__,
+            )
+            return []
 
     def get_recording_playback(self, meeting_id: str) -> TLDVPlaybackData:
         url = f"{self.base_url}/v1alpha1/meetings/{meeting_id}/download"
@@ -674,7 +760,20 @@ def _ensure_seekable_recording_file(session: DBSession) -> str:
             ]
 
             try:
-                res_cap = subprocess.run(cmd_capture, capture_output=True, text=True, timeout=900)
+                capture_timeout_seconds = 1800
+
+                if expected_duration_seconds:
+                    capture_timeout_seconds = max(
+                        1800,
+                        int(expected_duration_seconds * 1.25),
+                    )
+
+                res_cap = subprocess.run(
+                    cmd_capture,
+                    capture_output=True,
+                    text=True,
+                    timeout=capture_timeout_seconds,
+                )
                 if res_cap.returncode != 0:
                     logger.warning(
                         "Stream capture returned non-zero %d: %s",

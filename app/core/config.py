@@ -68,6 +68,10 @@ class Settings(BaseSettings):
     tldv_api_key: str | None = None
     tldv_api_base_url: str = "https://pasta.tldv.io"
     tldv_mock_mode: bool = False
+    # Shared secret used to verify incoming tl;dv webhook requests.
+    # Set this in tl;dv dashboard and match it here via TLDV_WEBHOOK_SECRET env var.
+    # If unset, the webhook endpoint will reject all incoming requests.
+    tldv_webhook_secret: str | None = None
 
     # Cloudflare R2
     r2_account_id: str | None = None

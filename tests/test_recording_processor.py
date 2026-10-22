@@ -3,6 +3,7 @@ import os
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 import pytest
+from botocore.exceptions import SSLError
 from sqlalchemy.orm import Session
 from app.models.cohort import Cohort
 from app.models.phase import Phase
@@ -158,16 +159,83 @@ def test_processing_failure_marks_failed(db: Session, sample_session: DBSession)
         status='ready',
         playback_url='https://puttanesca.tldv.io/download.mp4',
     )
+
     with patch('app.services.recording_processor.object_exists', return_value=False), \
          patch('app.services.recording_processor.get_tldv_client', return_value=mock_client), \
-         patch('app.services.recording_processor.ensure_seekable_recording_file', side_effect=RuntimeError('FFmpeg transport timeout')):
+         patch(
+             'app.services.recording_processor.ensure_seekable_recording_file',
+             side_effect=RuntimeError('FFmpeg produced invalid media output'),
+         ):
         result = process_session_recording_to_r2(sample_session.id, db=db)
+
         assert result.is_failed
         assert result.status == RecordingProcessingStatus.FAILED
-        assert 'FFmpeg transport timeout' in (result.error or '')
+        assert 'FFmpeg produced invalid media output' in (result.error or '')
+
         db.refresh(sample_session)
-        assert sample_session.recording_processing_status == RecordingProcessingStatus.FAILED
-        assert 'FFmpeg transport timeout' in (sample_session.recording_processing_error or '')
+
+        assert (
+            sample_session.recording_processing_status
+            == RecordingProcessingStatus.FAILED
+        )
+        assert (
+            'FFmpeg produced invalid media output'
+            in (sample_session.recording_processing_error or '')
+        )
+
+
+def test_transient_r2_ssl_failure_returns_pending(
+    db: Session,
+    sample_session: DBSession,
+):
+    mock_client = MagicMock()
+    mock_client.get_recording_playback.return_value = TLDVPlaybackData(
+        status='ready',
+        playback_url='https://puttanesca.tldv.io/download.mp4',
+    )
+
+    temp_seekable_path = (
+        f'/tmp/poc_media/session_{sample_session.id}_seekable.mp4'
+    )
+
+    ssl_error = SSLError(
+        endpoint_url='https://r2.example.invalid/recording.mp4',
+        error=RuntimeError('UNEXPECTED_EOF_WHILE_READING'),
+    )
+
+    with patch(
+        'app.services.recording_processor.object_exists',
+        return_value=False,
+    ), patch(
+        'app.services.recording_processor.get_tldv_client',
+        return_value=mock_client,
+    ), patch(
+        'app.services.recording_processor.ensure_seekable_recording_file',
+        return_value=temp_seekable_path,
+    ), patch(
+        'app.services.recording_processor.upload_file',
+        side_effect=ssl_error,
+    ) as mock_upload:
+
+        result = process_session_recording_to_r2(
+            sample_session.id,
+            db=db,
+        )
+
+        assert result.is_pending
+        assert result.status == RecordingProcessingStatus.PENDING
+        assert 'retried automatically' in (result.detail or '')
+        assert result.error is not None
+
+        mock_upload.assert_called_once()
+
+        db.refresh(sample_session)
+
+        assert (
+            sample_session.recording_processing_status
+            == RecordingProcessingStatus.PENDING
+        )
+        assert sample_session.recording_processing_error is not None
 
 def test_repeat_execution_after_success_does_not_reprocess(db: Session, sample_session: DBSession):
     expected_key = f'recordings/{sample_session.id}/recording.mp4'

@@ -10,11 +10,14 @@ Covers:
 """
 
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.core.security import (
     create_2fa_challenge_token,
@@ -171,6 +174,9 @@ def activate_account(
     7. account_status remains ``invited`` until 2FA is confirmed.
     8. Commit the transaction.
     """
+    # DIAGNOSTIC — temporary, remove once root cause of early expiry is confirmed.
+    logger.info("[ACTIVATE] activation attempt received")
+
     if data.password != data.confirm_password:
         raise WeakPasswordError("Passwords do not match.")
 
@@ -182,14 +188,45 @@ def activate_account(
     token_hash = hash_invitation_token(data.token)
     invitation = get_invitation_by_token_hash(db, token_hash)
 
-    if invitation is None:
-        raise InvalidInvitationError("Invalid or expired activation link.")
+    now = datetime.now(timezone.utc)
 
+    if invitation is None:
+        logger.warning(
+            "[ACTIVATE] failure=TOKEN_NOT_FOUND server_utc=%s",
+            now.isoformat(),
+        )
+        raise InvalidInvitationError(
+            "This activation link is no longer valid. "
+            "If you received more than one invitation email, "
+            "please use the most recent one."
+        )
+    # Log safe timing metadata for diagnosis (no raw token, no hash, no email).
+    logger.info(
+        "[ACTIVATE] invitation_found=True created_at=%s expires_at=%s "
+        "used_at=%s server_utc=%s",
+        invitation.created_at.isoformat() if invitation.created_at else "None",
+        invitation.expires_at.isoformat() if invitation.expires_at else "None",
+        invitation.used_at.isoformat() if invitation.used_at else "None",
+        now.isoformat(),
+    )
+    
     if invitation.used_at is not None:
+        logger.warning(
+            "[ACTIVATE] failure=TOKEN_ALREADY_USED used_at=%s server_utc=%s",
+            invitation.used_at.isoformat(),
+            now.isoformat(),
+        )
         raise InvalidInvitationError("This activation link has already been used.")
 
-    now = datetime.now(timezone.utc)
     if invitation.expires_at.replace(tzinfo=timezone.utc) < now:
+        logger.warning(
+            "[ACTIVATE] failure=TOKEN_EXPIRED expires_at=%s server_utc=%s "
+            "delta_seconds=%s expires_at_has_tzinfo=%s",
+            invitation.expires_at.isoformat(),
+            now.isoformat(),
+            (now - invitation.expires_at.replace(tzinfo=timezone.utc)).total_seconds(),
+            invitation.expires_at.tzinfo is not None,
+        )
         raise InvalidInvitationError("This activation link has expired.")
 
     user = get_user_by_id(
@@ -198,11 +235,20 @@ def activate_account(
     )
 
     if user is None:
+        logger.warning(
+            "[ACTIVATE] failure=ACCOUNT_STATE_INVALID reason=user_not_found server_utc=%s",
+            now.isoformat(),
+        )
         raise InvalidInvitationError(
             "User not found."
         )
 
     if user.account_status != AccountStatus.INVITED:
+        logger.warning(
+            "[ACTIVATE] failure=ACCOUNT_STATE_INVALID account_status=%s server_utc=%s",
+            user.account_status.value if user.account_status else "None",
+            now.isoformat(),
+        )
         raise AccountNotInvitedError(
             "This account has already been activated or is suspended."
         )
@@ -222,7 +268,9 @@ def activate_account(
     db.commit()
     db.refresh(user)
 
+    logger.info("[ACTIVATE] success user_id=%s", str(user.id))
     return user
+
 
 
 def resume_onboarding(

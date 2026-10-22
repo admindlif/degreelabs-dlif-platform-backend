@@ -1,4 +1,4 @@
-﻿"""
+"""
 Tests for Automatic Batch Recording Job (app.services.recording_jobs)
 Verifies:
 A. ended + pending + tldv_meeting_id session is selected
@@ -44,6 +44,23 @@ from app.services.recording_processor import RecordingProcessingResult
 
 @pytest.fixture
 def batch_setup(db: Session):
+    # Ensure test isolation: clean up any leftover test-owned records
+    # from previous interrupted runs of Batch Test Program in the test DB.
+    old_test_programs = (
+        db.query(Program)
+        .filter(Program.name == "Batch Test Program")
+        .all()
+    )
+    for old_prog in old_test_programs:
+        for c in old_prog.cohorts:
+            db.query(DBSession).filter(DBSession.cohort_id == c.id).delete()
+            db.delete(c)
+        for ph in old_prog.phases:
+            db.delete(ph)
+        db.delete(old_prog)
+    if old_test_programs:
+        db.commit()
+
     program = Program(name="Batch Test Program", code=f"BTP_{uuid4().hex[:6]}")
     db.add(program)
     db.flush()
@@ -234,8 +251,8 @@ def test_batch_limit_and_deterministic_ordering(db: Session, batch_setup: dict):
     phase = batch_setup["phase"]
     now_utc = datetime.now(timezone.utc)
 
-    # First clean any previous stray sessions for a clean count
-    db.query(DBSession).filter(DBSession.recording_processing_status == RecordingProcessingStatus.PENDING).delete()
+    # Ensure cohort has no pre-existing sessions for this test
+    db.query(DBSession).filter(DBSession.cohort_id == cohort.id).delete()
     db.commit()
 
     sessions = []
@@ -280,7 +297,7 @@ def test_provider_not_ready_does_not_stop_batch(db: Session, batch_setup: dict):
     phase = batch_setup["phase"]
     now_utc = datetime.now(timezone.utc)
 
-    db.query(DBSession).filter(DBSession.recording_processing_status == RecordingProcessingStatus.PENDING).delete()
+    db.query(DBSession).filter(DBSession.cohort_id == cohort.id).delete()
     db.commit()
 
     s1 = DBSession(
@@ -343,7 +360,7 @@ def test_failure_isolation_does_not_stop_batch(db: Session, batch_setup: dict):
     phase = batch_setup["phase"]
     now_utc = datetime.now(timezone.utc)
 
-    db.query(DBSession).filter(DBSession.recording_processing_status == RecordingProcessingStatus.PENDING).delete()
+    db.query(DBSession).filter(DBSession.cohort_id == cohort.id).delete()
     db.commit()
 
     s1 = DBSession(
