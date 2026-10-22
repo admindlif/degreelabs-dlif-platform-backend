@@ -47,10 +47,10 @@ jobs:
       R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
 
       # Required by Settings even though email is not used in this job
-      SECRET_KEY: ${{ secrets.SECRET_KEY }}
-      FRONTEND_BASE_URL: ${{ secrets.FRONTEND_BASE_URL }}
-      EMAIL_FROM_ADDRESS: ${{ secrets.EMAIL_FROM_ADDRESS }}
-      EMAIL_FROM_NAME: ${{ secrets.EMAIL_FROM_NAME }}
+      SECRET_KEY: ${{ secrets.SECRET_KEY || 'ci-dummy-secret-key-at-least-32-characters-long' }}
+      FRONTEND_BASE_URL: ${{ secrets.FRONTEND_BASE_URL || 'https://fellow.degreelabs.com' }}
+      EMAIL_FROM_ADDRESS: ${{ secrets.EMAIL_FROM_ADDRESS || 'notifications@degreelabs.com' }}
+      EMAIL_FROM_NAME: ${{ secrets.EMAIL_FROM_NAME || 'DegreeLabs DLIF' }}
 
     steps:
       - name: Checkout repository
