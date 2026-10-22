@@ -64,6 +64,27 @@ class Settings(BaseSettings):
     google_service_account_file: str | None = None
     google_workspace_organizer_email: str | None = None
 
+    # tl;dv Integration
+    tldv_api_key: str | None = None
+    tldv_api_base_url: str = "https://pasta.tldv.io"
+    tldv_mock_mode: bool = False
+    # Shared secret used to verify incoming tl;dv webhook requests.
+    # Set this in tl;dv dashboard and match it here via TLDV_WEBHOOK_SECRET env var.
+    # If unset, the webhook endpoint will reject all incoming requests.
+    tldv_webhook_secret: str | None = None
+
+    # Cloudflare R2
+    r2_account_id: str | None = None
+    r2_access_key_id: str | None = None
+    r2_secret_access_key: str | None = None
+    r2_bucket_name: str | None = None
+    r2_endpoint: str | None = None
+    r2_presigned_url_expiry_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=604800,
+    )
+
     @property
     def allowed_origins(self) -> list[str]:
         configured = self.cors_allowed_origins

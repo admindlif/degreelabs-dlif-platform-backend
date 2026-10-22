@@ -9,11 +9,12 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -30,6 +31,13 @@ class SessionStatus(str, Enum):
     LIVE = "live"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+
+
+class RecordingProcessingStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    READY = "ready"
+    FAILED = "failed"
 
 
 class Session(Base):
@@ -159,6 +167,55 @@ class Session(Base):
 
     transcript_url: Mapped[str | None] = mapped_column(
         String(500),
+        nullable=True,
+    )
+
+    # tl;dv Integration & Structured Media
+    tldv_meeting_id: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        index=True,
+    )
+
+    recording_status: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+    )
+
+    recording_duration_seconds: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    transcript_data: Mapped[list[dict] | dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+
+    # R2 Recording Processing State
+    recording_processing_status: Mapped[RecordingProcessingStatus] = mapped_column(
+        SQLEnum(
+            RecordingProcessingStatus,
+            name="recording_processing_status",
+            values_callable=lambda enum_cls: [item.value for item in enum_cls],
+        ),
+        nullable=False,
+        default=RecordingProcessingStatus.PENDING,
+        server_default=text("'pending'"),
+    )
+
+    recording_r2_key: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+    )
+
+    recording_processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    recording_processing_error: Mapped[str | None] = mapped_column(
+        Text,
         nullable=True,
     )
 

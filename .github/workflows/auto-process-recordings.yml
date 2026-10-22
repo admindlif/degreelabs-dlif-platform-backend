@@ -1,0 +1,117 @@
+name: Auto Process Recordings
+
+on:
+  # Runs every 20 minutes. NOTE: GitHub Actions schedule only fires on the
+  # default branch (main). Merge this workflow to main to activate the cron.
+  # On feature branches, use workflow_dispatch for manual testing.
+  schedule:
+    - cron: "*/20 * * * *"
+
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max sessions to process in this run"
+        required: false
+        default: "10"
+      dry_run:
+        description: "Dry run: validate secrets and candidate count only (no processing)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  # Only one instance of this workflow may run at a time to prevent
+  # two runners from claiming the same recording job.
+  group: process-recordings
+  cancel-in-progress: false
+
+jobs:
+  process:
+    name: Process Pending Recordings
+    runs-on: ubuntu-latest
+    timeout-minutes: 55   # stays safely within GitHub's 6-hour limit
+
+    env:
+      # Database (Supabase)
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      # tl;dv recording source
+      TLDV_API_KEY: ${{ secrets.TLDV_API_KEY }}
+      TLDV_MOCK_MODE: "false"
+
+      # Cloudflare R2 destination
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+
+      # Required by Settings even though email is not used in this job
+      SECRET_KEY: ${{ secrets.SECRET_KEY }}
+      FRONTEND_BASE_URL: ${{ secrets.FRONTEND_BASE_URL }}
+      EMAIL_FROM_ADDRESS: ${{ secrets.EMAIL_FROM_ADDRESS }}
+      EMAIL_FROM_NAME: ${{ secrets.EMAIL_FROM_NAME }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate required secrets
+        run: |
+          python - <<'EOF'
+          import os, sys
+          required = [
+              "DATABASE_URL",
+              "TLDV_API_KEY",
+              "R2_ACCOUNT_ID",
+              "R2_ACCESS_KEY_ID",
+              "R2_SECRET_ACCESS_KEY",
+              "R2_BUCKET_NAME",
+              "R2_ENDPOINT",
+          ]
+          missing = [k for k in required if not os.environ.get(k, "").strip()]
+          if missing:
+              for k in missing:
+                  print(f"::error::Missing required secret: {k}")
+              sys.exit(1)
+          print(f"All {len(required)} required secrets are present.")
+          EOF
+
+      - name: Discover pending recording candidates (dry-run info)
+        run: |
+          python - <<'EOF'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path(__file__).parent if hasattr(__file__, "parent") else Path.cwd()))
+          from app.db.session import SessionLocal
+          from app.services.recording_jobs import get_pending_recording_candidates
+          with SessionLocal() as db:
+              candidates = get_pending_recording_candidates(db, limit=50)
+          print(f"Pending recording candidates found: {len(candidates)}")
+          for s in candidates:
+              print(f"  - session {s.session_number}: {s.id} (ended {s.end_at})")
+          EOF
+
+      - name: Process pending recordings
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          LIMIT="${{ github.event.inputs.limit || '10' }}"
+          python scripts/process_pending_recordings.py --limit "$LIMIT"
+
+      - name: Dry run — skipping processing
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: echo "Dry run mode. No recordings were processed."

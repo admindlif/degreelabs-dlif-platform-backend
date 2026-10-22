@@ -95,5 +95,9 @@ class SessionDetailResponse(BaseModel):
     has_recording: bool = False
     has_transcript: bool = False
 
+    tldv_meeting_id: str | None = None
+    recording_status: str | None = None
+    recording_duration_seconds: int | None = None
+
     week_title: str | None = None
     week_number: int | None = None

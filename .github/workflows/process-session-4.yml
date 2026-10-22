@@ -1,0 +1,131 @@
+# .github/workflows/process-session-4.yml
+#
+# Transfers the DLIF Session 4 recording from tl;dv to Cloudflare R2.
+#
+# Constraints:
+#   - No DATABASE_URL secret is used.
+#   - No Supabase / PostgreSQL mutations are performed here.
+#   - The workflow is idempotent: if the R2 object already exists the job exits 0.
+#   - All logs are sanitised: signed URLs and API keys are never printed.
+#
+# After the workflow succeeds, run process_single_recording.py locally
+# (< 1 second) to update the sessions table (status -> READY).
+
+name: Process Session 4 — tl;dv to R2
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: "DLIF session UUID"
+        required: true
+        default: "7884161f-07e4-4359-ac28-923ebe6aec05"
+      tldv_meeting_id:
+        description: "tl;dv meeting ID"
+        required: true
+        default: "6ac64bc8b7e0a7001311c7b8"
+      min_duration_seconds:
+        description: "Minimum accepted duration (seconds)"
+        required: false
+        default: "1800"
+      dry_run:
+        description: "Dry run (no downloads/uploads)"
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches:
+      - feature/fellow-production-changes
+    paths:
+      - .github/workflows/process-session-4.yml
+
+jobs:
+  transfer:
+    name: Transfer recording to R2
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # R2 credentials — stored as GitHub Actions secrets, never in code.
+      R2_ACCOUNT_ID:        ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID:     ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET_NAME:       ${{ secrets.R2_BUCKET_NAME }}
+      TLDV_API_KEY:         ${{ secrets.TLDV_API_KEY }}
+
+      # Script parameters (with fallbacks for push events)
+      SESSION_ID:           ${{ inputs.session_id || '7884161f-07e4-4359-ac28-923ebe6aec05' }}
+      TLDV_MEETING_ID:      ${{ inputs.tldv_meeting_id || '6ac64bc8b7e0a7001311c7b8' }}
+      MIN_DURATION:         ${{ inputs.min_duration_seconds || '1800' }}
+      DRY_RUN:              ${{ inputs.dry_run == true && 'true' || 'false' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install boto3 botocore
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - name: Validate secrets present
+        run: |
+          missing=""
+          for var in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET_NAME TLDV_API_KEY; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Secret $var is not set"
+              missing="$missing $var"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing secrets:$missing"
+            exit 1
+          fi
+          echo "All required secrets are present."
+
+      - name: Syntax check
+        run: python -m py_compile scripts/transfer_session_to_r2.py && echo "Syntax OK"
+
+      - name: Dry-run validation
+        if: ${{ env.DRY_RUN == 'true' || env.DRY_RUN == true }}
+        run: |
+          python scripts/transfer_session_to_r2.py \
+            --session-id "$SESSION_ID" \
+            --tldv-meeting-id "$TLDV_MEETING_ID" \
+            --min-duration-seconds "$MIN_DURATION" \
+            --dry-run
+
+      - name: Transfer recording to R2
+        if: ${{ env.DRY_RUN != 'true' && env.DRY_RUN != true }}
+        run: |
+          python scripts/transfer_session_to_r2.py \
+            --session-id "$SESSION_ID" \
+            --tldv-meeting-id "$TLDV_MEETING_ID" \
+            --min-duration-seconds "$MIN_DURATION"
+
+      - name: Remind operator of next step
+        if: ${{ env.DRY_RUN != 'true' && env.DRY_RUN != true }}
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "  Transfer complete."
+          echo "  R2 object: recordings/$SESSION_ID/recording.mp4"
+          echo ""
+          echo "  NEXT STEP (run locally — not in CI):"
+          echo "  python scripts/process_single_recording.py --session-id $SESSION_ID --execute"
+          echo "  This updates the sessions table (status -> READY)."
+          echo "  No DATABASE_URL is required in GitHub Actions."
+          echo "=========================================="

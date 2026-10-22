@@ -42,3 +42,5 @@ httpx>=0.28.0
 google-api-python-client
 google-auth
 Pillow==12.3.0
+boto3==1.43.112
+static_ffmpeg==3.0
