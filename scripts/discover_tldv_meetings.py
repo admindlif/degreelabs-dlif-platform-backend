@@ -23,17 +23,22 @@ Security:
 """
 
 import argparse
-import logging
-import sys
 from datetime import datetime, timedelta, timezone
+import logging
 from pathlib import Path
+import re
+import sys
 
 backend_dir = Path(__file__).resolve().parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
 from app.db.session import SessionLocal
-from app.models.session import Session as DBSession, RecordingProcessingStatus
+from app.models.session import (
+    RecordingProcessingStatus,
+    Session as DBSession,
+    SessionStatus,
+)
 from app.services.tldv import TLDVMeetingData, get_tldv_client
 
 logging.basicConfig(
@@ -44,10 +49,43 @@ logger = logging.getLogger("scripts.discover_tldv_meetings")
 
 # ± tolerance window for matching a tl;dv meeting to a session start time
 _MATCH_WINDOW_HOURS = 2
-# Minimum meeting duration to consider a valid DLIF recording
-_MIN_DURATION_SECONDS = 3600
+# Minimum meeting duration to consider a valid DLIF recording (30 mins)
+_MIN_DURATION_SECONDS = 1800
 # DLIF keyword that must appear in the tl;dv meeting name
 _REQUIRED_KEYWORD = "dlif"
+
+
+def parse_happened_at(raw: str | None) -> datetime | None:
+    """Tolerantly parse tl;dv happenedAt timestamp to a UTC-aware datetime."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    # Try ISO format
+    try:
+        if raw.endswith("Z"):
+            return datetime.fromisoformat(raw[:-1] + "+00:00")
+        return datetime.fromisoformat(raw)
+    except Exception:
+        pass
+    # Try email/RFC 2822 format (e.g. 'Fri Oct 16 2026 13:32:08 GMT+0000 (Coordinated Universal Time)')
+    try:
+        import email.utils
+        parsed = email.utils.parsedate_to_datetime(raw)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        pass
+    # Fallback to dateutil parser
+    try:
+        from dateutil import parser
+        parsed = parser.parse(raw)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        logger.debug("Could not parse happenedAt: %s", raw)
+        return None
 
 
 def _is_candidate(
@@ -59,6 +97,8 @@ def _is_candidate(
     if meeting.meeting_id in already_used_meeting_ids:
         return False
 
+    name_lower = (meeting.name or "").lower()
+
     # 1. Direct Google Meet Conference ID match (Highest confidence: 95%+)
     if meeting.conference_id:
         norm_conf = meeting.conference_id.strip().lower()
@@ -67,38 +107,41 @@ def _is_candidate(
         if session.meeting_url and norm_conf in session.meeting_url.lower():
             return True
 
-    # 2. Heuristic match on time window, duration, and title keywords
-    if not session.start_at:
-        return False
-    if not meeting.happened_at:
-        return False
-    if _REQUIRED_KEYWORD not in meeting.name.lower():
-        return False
-    if (meeting.duration_seconds or 0) < _MIN_DURATION_SECONDS:
-        return False
+    # 2. Strong match on "dlif" + session number / title
+    if _REQUIRED_KEYWORD in name_lower:
+        s_num = session.session_number
+        patterns = [
+            rf"\bsession[ -]*0?{s_num}\b",
+            rf"\bsession[ -]*{s_num:02d}\b",
+        ]
+        if s_num == 0:
+            patterns.append(r"\binduction\b")
 
-    try:
-        # tl;dv happenedAt is in the format "Thu Oct 08 2026 13:15:00 GMT+0000 ..."
-        # Parse it tolerantly using datetime.fromisoformat after normalising.
-        raw = meeting.happened_at.strip()
-        # Try ISO format first (e.g. "2026-10-08T13:15:00Z")
-        if "T" in raw or raw.endswith("Z"):
-            happened_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        else:
-            # Fallback: parse "Thu Oct 08 2026 13:15:00 GMT+0000 (UTC)"
-            import email.utils
-            parsed = email.utils.parsedate_to_datetime(raw)
-            happened_at = parsed.astimezone(timezone.utc)
-    except Exception:
-        logger.debug("Could not parse happenedAt for meeting %s", meeting.meeting_id)
-        return False
+        for pat in patterns:
+            if re.search(pat, name_lower):
+                # Also verify title match or minimum meeting duration
+                if session.title and session.title.lower() in name_lower:
+                    return True
+                if (meeting.duration_seconds or 0) >= _MIN_DURATION_SECONDS:
+                    return True
 
-    session_start = session.start_at
-    if session_start.tzinfo is None:
-        session_start = session_start.replace(tzinfo=timezone.utc)
+    # 3. Time window heuristic match (within ±2h of session.start_at)
+    happened_at = parse_happened_at(meeting.happened_at)
+    if (
+        session.start_at
+        and happened_at
+        and _REQUIRED_KEYWORD in name_lower
+        and (meeting.duration_seconds or 0) >= _MIN_DURATION_SECONDS
+    ):
+        session_start = session.start_at
+        if session_start.tzinfo is None:
+            session_start = session_start.replace(tzinfo=timezone.utc)
 
-    delta = abs((happened_at - session_start).total_seconds())
-    return delta <= _MATCH_WINDOW_HOURS * 3600
+        delta = abs((happened_at - session_start).total_seconds())
+        if delta <= _MATCH_WINDOW_HOURS * 3600:
+            return True
+
+    return False
 
 
 
@@ -117,7 +160,7 @@ def run_discovery(execute: bool = False) -> int:
 
     # Build a set of already-used meeting IDs (referenced by any session)
     with SessionLocal() as db:
-        all_sessions = db.query(DBSession).all()
+        all_sessions = db.query(DBSession).order_by(DBSession.session_number).all()
         already_used: set[str] = {
             s.tldv_meeting_id
             for s in all_sessions
@@ -126,8 +169,7 @@ def run_discovery(execute: bool = False) -> int:
         unmatched_sessions = [
             s for s in all_sessions
             if not s.tldv_meeting_id
-            and s.end_at is not None
-            and s.end_at <= datetime.now(timezone.utc)
+            and s.status != SessionStatus.CANCELLED
         ]
 
     print(f"  Sessions already matched to tl;dv: {len(already_used)}")
@@ -220,6 +262,19 @@ def run_discovery(execute: bool = False) -> int:
                 continue
 
             db_session.tldv_meeting_id = meeting.meeting_id
+
+            # Populate missing session timestamps from the tl;dv meeting
+            happened_at = parse_happened_at(meeting.happened_at)
+            if db_session.start_at is None and happened_at:
+                db_session.start_at = happened_at
+            if db_session.end_at is None and happened_at:
+                duration_sec = meeting.duration_seconds or 3600
+                db_session.end_at = happened_at + timedelta(seconds=duration_sec)
+
+            # Ensure session is marked completed since a recorded meeting exists
+            if db_session.status != SessionStatus.COMPLETED and db_session.status != SessionStatus.CANCELLED:
+                db_session.status = SessionStatus.COMPLETED
+
             # Reset to PENDING so the batch processor picks it up
             if db_session.recording_processing_status not in (
                 RecordingProcessingStatus.READY,
