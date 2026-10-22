@@ -247,9 +247,14 @@ def main() -> int:
         action="store_true",
         help="Write auto-matches to the database (default: dry-run only)",
     )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip interactive confirmation (for CI/GitHub Actions)",
+    )
     args = parser.parse_args()
 
-    if args.execute:
+    if args.execute and not args.yes:
         print("=" * 70)
         print("WARNING: --execute will write tldv_meeting_id to the database.")
         print("Only unambiguous matches (exactly one candidate) will be applied.")

@@ -92,6 +92,9 @@ jobs:
       - name: Run database migrations
         run: alembic upgrade head
 
+      - name: Discover and link tl;dv meetings to sessions
+        run: python scripts/discover_tldv_meetings.py --execute --yes
+
       - name: Discover pending recording candidates (dry-run info)
         run: |
           python - <<'EOF'
