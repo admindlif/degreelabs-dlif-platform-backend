@@ -89,6 +89,9 @@ jobs:
           print(f"All {len(required)} required secrets are present.")
           EOF
 
+      - name: Run database migrations
+        run: alembic upgrade head
+
       - name: Discover pending recording candidates (dry-run info)
         run: |
           python - <<'EOF'
