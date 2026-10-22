@@ -1,0 +1,36 @@
+name: R2 Upload Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_mib:
+        description: "Size in MiB"
+        required: false
+        default: "256"
+
+defaults:
+  run:
+    shell: bash
+
+permissions: {}
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install boto3
+      - name: Run benchmark
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          python scripts/r2_upload_benchmark.py --compare --size-mib ${{ inputs.size_mib }} --label github-actions

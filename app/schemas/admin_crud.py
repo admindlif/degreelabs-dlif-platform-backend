@@ -187,7 +187,8 @@ class SessionCreate(BaseModel):
     transcript_url: Optional[str] = Field(
         None,
         max_length=500,
-    )   
+    )
+    tldv_meeting_id: Optional[str] = Field(None, max_length=100)
 
     @field_validator("meeting_url", "recording_url", "transcript_url", mode="before")
     @classmethod
@@ -213,6 +214,9 @@ class SessionUpdate(BaseModel):
         None,
         max_length=500,
     )
+    tldv_meeting_id: Optional[str] = Field(None, max_length=100)
+    recording_status: Optional[str] = Field(None, max_length=50)
+    recording_duration_seconds: Optional[int] = Field(None, ge=0)
 
     @field_validator("meeting_url", "recording_url", "transcript_url", mode="before")
     @classmethod
@@ -241,6 +245,9 @@ class SessionResponse(BaseModel):
     meeting_url: Optional[str]
     recording_url: Optional[str]
     transcript_url: Optional[str] = None
+    tldv_meeting_id: Optional[str] = None
+    recording_status: Optional[str] = None
+    recording_duration_seconds: Optional[int] = None
 
     meeting_provider: Optional[str] = None
     google_meet_space_name: Optional[str] = None

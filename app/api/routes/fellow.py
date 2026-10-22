@@ -1,5 +1,5 @@
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.permissions import require_fellow_portal
@@ -53,6 +53,16 @@ from app.services.checklist import (
     get_fellow_checklist,
     get_fellow_checklist_reminders,
     update_fellow_checklist_completion,
+)
+from app.schemas.session_media import (
+    SessionRecordingPlaybackResponse,
+    SessionTranscriptResponse,
+)
+from app.services.tldv import (
+    get_session_recording_playback_for_fellow,
+    get_session_transcript_for_fellow,
+    stream_poc_seekable_recording_for_fellow,
+    stream_seekable_recording_for_fellow,
 )
 router = APIRouter(prefix="/fellow", tags=["Fellow Portal"])
 
@@ -157,6 +167,77 @@ def get_session_resources(
         current_user,
         session_id,
     )
+
+
+@router.get(
+    "/sessions/{session_id}/recording",
+    response_model=SessionRecordingPlaybackResponse,
+    summary="Get in-portal video recording playback for an unlocked Session",
+)
+def get_session_recording(
+    session_id: UUID,
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> SessionRecordingPlaybackResponse:
+    return get_session_recording_playback_for_fellow(
+        db,
+        current_user,
+        session_id,
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/seekable-stream",
+    summary="Stream seekable MP4 recording with HTTP 206 byte-range support",
+)
+def stream_session_recording(
+    session_id: UUID,
+    range: str | None = Header(None, alias="Range"),
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> Response:
+    return stream_seekable_recording_for_fellow(
+        db,
+        current_user,
+        session_id,
+        range_header=range,
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/poc-seekable-stream",
+    summary="Stream local processed seekable MP4 recording with HTTP 206 byte-range support (Phase 7A POC)",
+)
+def stream_session_poc_recording(
+    session_id: UUID,
+    range: str | None = Header(None, alias="Range"),
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> Response:
+    return stream_poc_seekable_recording_for_fellow(
+        db,
+        current_user,
+        session_id,
+        range_header=range,
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/transcript",
+    response_model=SessionTranscriptResponse,
+    summary="Get structured in-portal transcript for an unlocked Session",
+)
+def get_session_transcript(
+    session_id: UUID,
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> SessionTranscriptResponse:
+    return get_session_transcript_for_fellow(
+        db,
+        current_user,
+        session_id,
+    )
+
 
 @router.get(
     "/sessions/{session_id}/submission",

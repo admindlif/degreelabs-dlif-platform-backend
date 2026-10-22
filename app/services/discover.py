@@ -135,6 +135,8 @@ def _to_session_summary(
 
         has_recording=bool(
             session.recording_url
+            or getattr(session, "recording_r2_key", None)
+            or getattr(session, "tldv_meeting_id", None)
         ),
 
         has_transcript=bool(
@@ -305,7 +307,7 @@ def get_discover_weeks(db: Session, current_user: User) -> list[DiscoverWeekResp
     results = []
     for w in weeks:
         w_sessions = [_to_session_summary(s) for s in week_sessions_map.get(w.id, [])]
-        
+
         # Determine status
         if w.week_number < active_week_number:
             week_status = "completed"
@@ -359,7 +361,7 @@ def get_session_detail(db: Session, current_user: User, session_id: UUID) -> Ses
             detail=(
                 "This Session is locked and is not yet available."
             ),
-        )   
+        )
 
     return SessionDetailResponse(
         id=session.id,
@@ -405,11 +407,17 @@ def get_session_detail(db: Session, current_user: User, session_id: UUID) -> Ses
 
         has_recording=bool(
             session.recording_url
+            or getattr(session, "recording_r2_key", None)
+            or getattr(session, "tldv_meeting_id", None)
         ),
 
         has_transcript=bool(
-            session.transcript_url
+            session.transcript_url or getattr(session, "tldv_meeting_id", None)
         ),
+
+        tldv_meeting_id=getattr(session, "tldv_meeting_id", None),
+        recording_status=getattr(session, "recording_status", None),
+        recording_duration_seconds=getattr(session, "recording_duration_seconds", None),
 
         week_title=(
             session.week.title
