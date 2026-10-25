@@ -57,6 +57,41 @@ def _to_session_summary(
     unlocked = is_session_unlocked(session)
 
     # ---------------------------------------------------------
+    # COMPLETED SESSION
+    #
+    # A session marked COMPLETED by an Admin always surfaces
+    # with its real status, even if is_unlocked is False.
+    # Masking a completed session as "locked" would cause:
+    #   - The sidebar completion counter to under-count.
+    #   - The week status to disagree with actual progress.
+    # ---------------------------------------------------------
+    if session.status == SessionStatus.COMPLETED:
+        return SessionSummary(
+            id=session.id,
+            session_number=session.session_number,
+            session_type=(
+                session.session_type.value
+                if hasattr(session.session_type, "value")
+                else str(session.session_type)
+            ),
+            title=session.title,
+            description=session.description,
+            start_at=session.start_at,
+            end_at=session.end_at,
+            unlock_at=session.unlock_at,
+            submission_enabled=session.submission_enabled,
+            meeting_url=session.meeting_url,
+            recording_url=session.recording_url,
+            transcript_url=session.transcript_url,
+            status="completed",
+            sequence=session.sequence,
+            # A completed session is implicitly accessible.
+            is_unlocked=True,
+            has_recording=bool(session.recording_url),
+            has_transcript=bool(session.transcript_url),
+        )
+
+    # ---------------------------------------------------------
     # LOCKED SESSION
     #
     # Fellows can know the Session exists, but nothing
@@ -66,71 +101,50 @@ def _to_session_summary(
         return SessionSummary(
             id=session.id,
             session_number=session.session_number,
-
             session_type=None,
-
             # Do not expose the real Session title yet.
             title=f"Session {session.session_number}",
-
             description=None,
-
             start_at=None,
             end_at=None,
             unlock_at=None,
-
             submission_enabled=False,
-
             meeting_url=None,
             recording_url=None,
             transcript_url=None,
-
             status="locked",
             sequence=session.sequence,
-
             is_unlocked=False,
             has_recording=False,
             has_transcript=False,
         )
 
     # ---------------------------------------------------------
-    # UNLOCKED SESSION
+    # UNLOCKED SESSION (SCHEDULED or LIVE)
     # ---------------------------------------------------------
     return SessionSummary(
         id=session.id,
         session_number=session.session_number,
-
         session_type=(
             session.session_type.value
-            if hasattr(
-                session.session_type,
-                "value",
-            )
+            if hasattr(session.session_type, "value",)
             else str(session.session_type)
         ),
-
         title=session.title,
         description=session.description,
-
         start_at=session.start_at,
         end_at=session.end_at,
         unlock_at=session.unlock_at,
-
-        submission_enabled=(
-            session.submission_enabled
-        ),
-
+        submission_enabled=(session.submission_enabled),
         meeting_url=session.meeting_url,
         recording_url=session.recording_url,
         transcript_url=session.transcript_url,
-
         status=(
             session.status.value
             if hasattr(session.status, "value")
             else str(session.status)
         ),
-
         sequence=session.sequence,
-
         is_unlocked=True,
 
         has_recording=bool(
@@ -143,6 +157,8 @@ def _to_session_summary(
             session.transcript_url
         ),
     )
+
+
 def get_fellow_sessions(
     db: Session,
     current_user: User,
@@ -150,34 +166,38 @@ def get_fellow_sessions(
     """
     Return every session assigned to the Fellow's active cohort.
     """
-
-    enrollment = get_active_enrollment_for_user(
-        db,
-        current_user.id,
-    )
-
+    enrollment = get_active_enrollment_for_user(db, current_user.id)
     if not enrollment:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No active cohort enrollment found for current Fellow.",
         )
 
+    cohort = enrollment.cohort
+    phase = get_phase_by_code(db, cohort.program_id, code="DISCOVER")
+    if not phase:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Active DISCOVER phase not found.",
+        )
+
     sessions = db.scalars(
-        select(DBSession)
-        .where(
-            DBSession.cohort_id
-            == enrollment.cohort_id
-        )
-        .order_by(
-            DBSession.sequence.asc(),
-            DBSession.start_at.asc(),
-        )
-    ).all()
+            select(DBSession)
+            .where(
+                DBSession.cohort_id == cohort.id,
+                DBSession.phase_id == phase.id,
+            )
+            .order_by(
+                DBSession.sequence.asc(),
+                DBSession.start_at.asc(),
+            )
+        ).all()
 
     return [
         _to_session_summary(session)
         for session in sessions
     ]
+
 
 def get_discover_overview(db: Session, current_user: User) -> DiscoverOverviewResponse:
     enrollment = get_active_enrollment_for_user(db, current_user.id)
@@ -298,24 +318,38 @@ def get_discover_weeks(db: Session, current_user: User) -> list[DiscoverWeekResp
             key=lambda x: x.sequence,
         )
 
-    # Find the current active week
+    # Fallback active week – used for weeks that have no sessions yet.
     next_session_db = get_next_session_for_cohort(db, cohort.id, phase.id)
-    active_week_number = 1
+    fallback_active_week_number = 1
     if next_session_db and next_session_db.week:
-        active_week_number = next_session_db.week.week_number
+        fallback_active_week_number = next_session_db.week.week_number
 
     results = []
     for w in weeks:
-        w_sessions = [_to_session_summary(s) for s in week_sessions_map.get(w.id, [])]
+        raw_sessions = week_sessions_map.get(w.id, [])
+        w_sessions = [_to_session_summary(s) for s in raw_sessions]
 
-        # Determine status
-        if w.week_number < active_week_number:
+        # -----------------------------------------------------------------
+        # Determine week status from ACTUAL session completion in the DB.
+        #
+        # A week is "completed" only when ALL of its non-induction sessions
+        # have status == COMPLETED in the raw database record.  Using raw
+        # objects (before _to_session_summary can mask locked sessions)
+        # ensures the week badge and the sidebar completion counter always
+        # report the same truth.
+        # -----------------------------------------------------------------
+        non_induction_raw = [s for s in raw_sessions if s.session_number != 0]
+        total_non_induction = len(non_induction_raw)
+        completed_count = sum(1 for s in non_induction_raw if s.status == SessionStatus.COMPLETED)
+        all_non_induction_done = total_non_induction > 0 and completed_count == total_non_induction
+
+        if all_non_induction_done:
             week_status = "completed"
             status_badge = "Completed"
-        elif w.week_number == active_week_number:
+        elif w.week_number == fallback_active_week_number or completed_count > 0 or (w.week_number < fallback_active_week_number and not all_non_induction_done):
             week_status = "active"
-            status_badge = "Current Week • In Progress"
-        elif w.week_number == active_week_number + 1:
+            status_badge = "Current Week • In Progress" if w.week_number == fallback_active_week_number else "In Progress"
+        elif w.week_number == fallback_active_week_number + 1:
             week_status = "upcoming"
             status_badge = "Upcoming"
         else:
@@ -431,3 +465,6 @@ def get_session_detail(db: Session, current_user: User, session_id: UUID) -> Ses
             else None
         ),
     )
+
+
+
