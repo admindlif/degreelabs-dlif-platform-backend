@@ -64,7 +64,51 @@ from app.services.tldv import (
     stream_poc_seekable_recording_for_fellow,
     stream_seekable_recording_for_fellow,
 )
+from app.schemas.homepage import (
+    FellowHomepageResponse,
+    PhaseAccessVerificationResponse,
+)
+from app.services.homepage import (
+    get_fellow_homepage,
+    verify_fellow_phase_access,
+)
 router = APIRouter(prefix="/fellow", tags=["Fellow Portal"])
+
+
+@router.get(
+    "/homepage",
+    response_model=FellowHomepageResponse,
+    summary="Get Fellow homepage with 3-phase roadmap and progression access",
+)
+def get_homepage(
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> FellowHomepageResponse:
+    return get_fellow_homepage(db, current_user)
+
+
+@router.get(
+    "/validate/overview",
+    response_model=PhaseAccessVerificationResponse,
+    summary="Access VALIDATE phase overview (protected by company shortlisting)",
+)
+def get_validate_overview(
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> PhaseAccessVerificationResponse:
+    return verify_fellow_phase_access(db, current_user, "VALIDATE")
+
+
+@router.get(
+    "/grow/overview",
+    response_model=PhaseAccessVerificationResponse,
+    summary="Access GROW phase overview (protected by company paid implementation approval)",
+)
+def get_grow_overview(
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> PhaseAccessVerificationResponse:
+    return verify_fellow_phase_access(db, current_user, "GROW")
 
 
 @router.get(

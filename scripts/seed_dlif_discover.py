@@ -98,6 +98,27 @@ def seed_dlif() -> None:
             phase.is_active = True
             print(f"  * Existing Phase: {phase.name}")
 
+        for code, name, role, seq, duration, desc in [
+            ("VALIDATE", "VALIDATE", "PROVE", 2, 4, "A 4-week validation phase requiring company shortlisting."),
+            ("GROW", "GROW", "DELIVER", 3, None, "A 3-6 month delivery phase requiring company approval for paid implementation."),
+        ]:
+            extra_phase = db.scalars(
+                select(Phase).where(Phase.program_id == program.id, Phase.code == code)
+            ).first()
+            if not extra_phase:
+                extra_phase = Phase(
+                    program_id=program.id,
+                    code=code,
+                    name=name,
+                    development_role=role,
+                    sequence=seq,
+                    duration_weeks=duration,
+                    description=desc,
+                    is_active=True,
+                )
+                db.add(extra_phase)
+                print(f"  + Created Phase: {extra_phase.name} ({extra_phase.development_role})")
+
         initialization = initialize_discover_sessions_for_cohort(db, cohort)
         for week_number in initialization.created_week_numbers:
             print(f"  + Created canonical Week {week_number}")

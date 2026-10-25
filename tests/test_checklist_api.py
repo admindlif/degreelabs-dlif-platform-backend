@@ -239,7 +239,12 @@ def test_fellow_cannot_complete_item_outside_scope(client, db, checklist_context
         json={"is_completed": True},
     )
     assert response.status_code == 404
-    assert db.query(FellowChecklistCompletion).count() == 0
+    assert (
+        db.query(FellowChecklistCompletion)
+        .filter(FellowChecklistCompletion.checklist_item_id == item.id)
+        .count()
+        == 0
+    )
 
 
 def test_checklist_requires_fellow_access(client, admin_headers, checklist_context):

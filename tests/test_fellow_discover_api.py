@@ -27,7 +27,7 @@ from app.models.program import Program
 from app.models.session import Session as DBSession, SessionStatus, SessionType
 from app.models.user import AccountStatus, User, UserRole
 from app.models.week import Week
-from apps.student_api.main import app as student_app
+from app.main import app as student_app
 from app.models.resource import (
     Resource,
     ResourceType,

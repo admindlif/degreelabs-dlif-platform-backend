@@ -1,4 +1,4 @@
-﻿from app.models.cohort import Cohort, CohortStatus
+from app.models.cohort import Cohort, CohortStatus
 from app.models.enrollment import Enrollment, EnrollmentStatus
 from app.models.phase import Phase
 from app.models.program import Program
@@ -12,6 +12,7 @@ from app.models.week import Week
 from app.models.submission import TeamSubmission
 from app.models.feedback import SubmissionFeedback
 from app.models.checklist import ChecklistItem, FellowChecklistCompletion
+from app.models.progression import TeamPhaseProgression
 
 __all__ = [
     "User",
@@ -39,4 +40,5 @@ __all__ = [
     "SubmissionFeedback",
     "ChecklistItem",
     "FellowChecklistCompletion",
+    "TeamPhaseProgression",
 ]

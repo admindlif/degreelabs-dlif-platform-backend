@@ -1,4 +1,4 @@
-﻿from datetime import datetime
+from datetime import datetime
 from enum import Enum
 from uuid import UUID, uuid4
 
@@ -109,6 +109,12 @@ class Team(Base):
 
     challenge_resources = relationship(
         "TeamChallengeResource",
+        back_populates="team",
+        cascade="all, delete-orphan",
+    )
+
+    phase_progressions = relationship(
+        "TeamPhaseProgression",
         back_populates="team",
         cascade="all, delete-orphan",
     )

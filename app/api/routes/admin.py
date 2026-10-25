@@ -1,4 +1,4 @@
-﻿"""
+"""
 Admin routes — full CRUD for all platform entities.
 
 Only ADMIN and SUPER_ADMIN roles may access these endpoints.
@@ -27,8 +27,17 @@ from app.models.team import (
     TeamMemberRole,
     TeamChallengeResource,
 )
+from app.models.progression import TeamPhaseProgression
 from app.models.user import AccountStatus, User, UserRole
 from app.models.week import Week
+from app.schemas.progression import (
+    TeamPhaseProgressionResponse,
+    TeamPhaseProgressionUpdate,
+)
+from app.repositories.progression import (
+    get_team_phase_progressions,
+    upsert_team_phase_progression,
+)
 from app.schemas.admin_crud import (
     CohortCreate,
     CohortUpdate,
@@ -2148,6 +2157,56 @@ def delete_team(team_id: str, db: Session = Depends(get_db), _admin: User = Depe
         raise _not_found("Team", team_id)
     db.delete(team)
     db.commit()
+
+
+@router.get(
+    "/teams/{team_id}/phase-progression",
+    response_model=list[TeamPhaseProgressionResponse],
+    summary="Get phase progressions and company approval decisions for a Team",
+)
+def get_team_progressions(
+    team_id: UUID,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+) -> list[TeamPhaseProgressionResponse]:
+    team = db.scalar(select(Team).where(Team.id == team_id))
+    if not team:
+        raise _not_found("Team", team_id)
+    return get_team_phase_progressions(db, team.id)
+
+
+@router.put(
+    "/teams/{team_id}/phase-progression",
+    response_model=TeamPhaseProgressionResponse,
+    summary="Record company phase shortlisting or paid implementation approval for a Team",
+)
+def update_team_progression(
+    team_id: UUID,
+    data: TeamPhaseProgressionUpdate,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+) -> TeamPhaseProgressionResponse:
+    team = db.scalar(select(Team).where(Team.id == team_id))
+    if not team:
+        raise _not_found("Team", team_id)
+
+    valid_phases = {"VALIDATE", "GROW"}
+    if data.phase_code.upper() not in valid_phases:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid phase_code. Must be one of {valid_phases}",
+        )
+
+    return upsert_team_phase_progression(
+        db=db,
+        team_id=team.id,
+        cohort_id=team.cohort_id,
+        phase_code=data.phase_code,
+        status=data.status,
+        decision=data.decision,
+        decided_by_user_id=_admin.id,
+        notes=data.notes,
+    )
 
 
 @router.post(

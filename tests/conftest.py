@@ -83,6 +83,10 @@ def ensure_test_database():
             f"Current database: {database_name}"
         )
 
+    from app.db.base import Base
+    import app.models  # noqa: F401
+    Base.metadata.create_all(bind=test_engine)
+
 
 @pytest.fixture(scope="session")
 def db_session() -> Generator[Session, None, None]:
