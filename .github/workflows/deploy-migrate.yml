@@ -1,0 +1,87 @@
+name: Deploy — Run Database Migrations
+
+# Runs automatically on every push to main, and can be triggered manually.
+# This ensures the production Supabase database is always in sync with the
+# latest Alembic migrations after every deployment to Render.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "alembic/**"
+      - "app/models/**"
+      - "app/db/**"
+      - "requirements.txt"
+      - ".github/workflows/deploy-migrate.yml"
+
+  # Allow manual trigger from the Actions tab for emergency migrations
+  workflow_dispatch:
+
+concurrency:
+  # Only one migration may run at a time to prevent race conditions
+  group: db-migrate
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    name: Apply Database Migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # Production database (Supabase) — set in GitHub repo secrets
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      # Required by app Settings validation at import time
+      SECRET_KEY: ${{ secrets.SECRET_KEY || 'ci-dummy-secret-key-at-least-32-characters-long' }}
+      FRONTEND_BASE_URL: ${{ secrets.FRONTEND_BASE_URL || 'https://fellow.degreelabs.com' }}
+      EMAIL_FROM_ADDRESS: ${{ secrets.EMAIL_FROM_ADDRESS || 'notifications@degreelabs.com' }}
+      EMAIL_FROM_NAME: ${{ secrets.EMAIL_FROM_NAME || 'DegreeLabs DLIF' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify DATABASE_URL is set
+        run: |
+          python - <<'EOF'
+          import os, sys
+          url = os.environ.get("DATABASE_URL", "").strip()
+          if not url:
+              print("::error::DATABASE_URL secret is not set. Cannot run migrations.")
+              sys.exit(1)
+          # Mask the password portion in logs
+          import re
+          safe = re.sub(r"://([^:]+):([^@]+)@", r"://\1:****@", url)
+          print(f"DATABASE_URL is set: {safe}")
+          EOF
+
+      - name: Show current migration state (before)
+        run: alembic current
+        continue-on-error: true
+
+      - name: Apply database migrations
+        run: alembic upgrade head
+
+      - name: Show migration state (after)
+        run: alembic current
+
+      - name: Verify database connectivity
+        run: |
+          python - <<'EOF'
+          from app.db.session import engine
+          from sqlalchemy import text
+          with engine.connect() as conn:
+              conn.execute(text("SELECT 1"))
+          print("Database connectivity verified successfully.")
+          EOF

@@ -89,8 +89,6 @@ jobs:
           print(f"All {len(required)} required secrets are present.")
           EOF
 
-      - name: Run database migrations
-        run: alembic upgrade head
 
       - name: Discover and link tl;dv meetings to sessions
         run: python scripts/discover_tldv_meetings.py --execute --yes
