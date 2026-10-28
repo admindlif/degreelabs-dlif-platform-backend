@@ -2244,3 +2244,140 @@ def test_fellow_company_challenge_isolated_by_team(
     finally:
         db.delete(other_team)
         db.commit()
+
+
+# =============================================================================
+# Week 1 Completion Consistency Tests
+# =============================================================================
+
+def test_completed_session_with_is_unlocked_false_shows_as_completed(
+    db: Session,
+    student_client: TestClient,
+    fellow_user: User,
+    setup_fellow_cohort,
+):
+    """
+    A session that has status=COMPLETED in the DB must return status='completed'
+    in the API even when is_unlocked=False.
+    """
+    cohort = setup_fellow_cohort["cohort"]
+    phase = setup_fellow_cohort["phase"]
+
+    token = create_access_token(
+        subject=str(fellow_user.id),
+        role=fellow_user.role.value,
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    session1 = (
+        db.query(DBSession)
+        .filter(
+            DBSession.cohort_id == cohort.id,
+            DBSession.phase_id == phase.id,
+            DBSession.session_number == 1,
+        )
+        .first()
+    )
+    assert session1 is not None
+
+    orig_status = session1.status
+    orig_unlocked = session1.is_unlocked
+    session1.status = SessionStatus.COMPLETED
+    session1.is_unlocked = False
+    db.commit()
+
+    try:
+        response = student_client.get(
+            "/api/v1/fellow/discover/weeks",
+            headers=headers,
+        )
+        assert response.status_code == 200
+        weeks = response.json()
+
+        week1 = next((w for w in weeks if w["week_number"] == 1), None)
+        assert week1 is not None
+
+        s1_summary = next(
+            (s for s in week1["sessions"] if s["session_number"] == 1),
+            None,
+        )
+        assert s1_summary is not None
+        assert s1_summary["status"] == "completed"
+        assert s1_summary["is_unlocked"] is True
+    finally:
+        session1.status = orig_status
+        session1.is_unlocked = orig_unlocked
+        db.commit()
+
+
+def test_week_status_is_completed_only_when_all_sessions_done(
+    db: Session,
+    student_client: TestClient,
+    fellow_user: User,
+    setup_fellow_cohort,
+):
+    """
+    Week 1 must show status='completed' only when ALL of its non-induction
+    sessions have DB status=COMPLETED.
+    """
+    cohort = setup_fellow_cohort["cohort"]
+    phase = setup_fellow_cohort["phase"]
+    week1 = (
+        db.query(Week)
+        .filter(Week.phase_id == phase.id, Week.week_number == 1)
+        .first()
+    )
+    assert week1 is not None
+
+    token = create_access_token(
+        subject=str(fellow_user.id),
+        role=fellow_user.role.value,
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    week1_sessions = (
+        db.query(DBSession)
+        .filter(
+            DBSession.cohort_id == cohort.id,
+            DBSession.phase_id == phase.id,
+            DBSession.week_id == week1.id,
+            DBSession.session_number != 0,
+        )
+        .all()
+    )
+    assert week1_sessions
+
+    saved = {s.id: (s.status, s.is_unlocked) for s in week1_sessions}
+
+    try:
+        # Scenario A: 2 of 3 sessions completed
+        for i, s in enumerate(week1_sessions):
+            if i < len(week1_sessions) - 1:
+                s.status = SessionStatus.COMPLETED
+                s.is_unlocked = True
+            else:
+                s.status = SessionStatus.SCHEDULED
+                s.is_unlocked = True
+        db.commit()
+
+        response = student_client.get("/api/v1/fellow/discover/weeks", headers=headers)
+        assert response.status_code == 200
+        w1 = next(w for w in response.json() if w["week_number"] == 1)
+        assert w1["status"] != "completed"
+        assert w1["status"] == "active"
+
+        # Scenario B: All sessions completed
+        for s in week1_sessions:
+            s.status = SessionStatus.COMPLETED
+            s.is_unlocked = True
+        db.commit()
+
+        response = student_client.get("/api/v1/fellow/discover/weeks", headers=headers)
+        assert response.status_code == 200
+        w1 = next(w for w in response.json() if w["week_number"] == 1)
+        assert w1["status"] == "completed"
+
+    finally:
+        for s in week1_sessions:
+            s.status, s.is_unlocked = saved[s.id]
+        db.commit()
