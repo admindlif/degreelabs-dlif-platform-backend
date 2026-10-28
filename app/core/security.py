@@ -75,6 +75,7 @@ def create_access_token(
     payload: dict = {
         "sub": subject,
         "exp": expires_at,
+        "iat": datetime.now(timezone.utc).timestamp(),
         "type": _TOKEN_TYPE_ACCESS,
     }
     if role is not None:
@@ -255,3 +256,33 @@ def verify_totp(secret: str, code: str) -> bool:
     """
     totp = pyotp.TOTP(secret)
     return totp.verify(code, valid_window=1)
+import hmac
+
+def generate_numeric_recovery_code() -> str:
+    """Generate a cryptographically secure 8-digit numeric verification code."""
+    return f"{secrets.randbelow(100000000):08d}"
+
+
+def hash_recovery_code(code: str) -> str:
+    """HMAC-SHA256 hex-digest of an 8-digit recovery code using the server secret key."""
+    return hmac.new(
+        settings.secret_key.encode("utf-8"),
+        code.strip().encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_recovery_code(code: str, code_hash: str) -> bool:
+    """Timing-safe verification of recovery code hash."""
+    expected = hash_recovery_code(code)
+    return hmac.compare_digest(expected, code_hash)
+
+
+def generate_reset_authorization_token() -> str:
+    """Generate a high-entropy URL-safe token for one-time password reset authorization."""
+    return secrets.token_urlsafe(32)
+
+
+def hash_reset_token(raw_token: str) -> str:
+    """SHA-256 hex-digest of a raw reset authorization token."""
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()

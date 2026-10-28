@@ -15,9 +15,11 @@ google-meet-token*.json
 
 # Python virtual environments
 .venv/
+.venv-wsl/
 venv/
 env/
 ENV/
+scratch/
 
 # Python cache
 __pycache__/

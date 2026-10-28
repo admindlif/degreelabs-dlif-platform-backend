@@ -42,16 +42,32 @@ from app.services.submission import (
 )
 
 from app.schemas.feedback import SubmissionFeedbackDetail
+from app.schemas.session_overview import SessionOverviewResponse
+from app.services.session_overview import get_fellow_session_overview
 from app.services.feedback import get_fellow_session_feedback
+from app.schemas.working_board import (
+    FellowWorkingBoardInsightsResponse,
+    FellowWorkingBoardResponse,
+)
+from app.services.working_board import (
+    get_fellow_working_board,
+    get_fellow_working_board_insights,
+)
 from app.schemas.checklist import (
     ChecklistCompletionUpdate,
     ChecklistRemindersResponse,
     FellowChecklistItemResponse,
     FellowChecklistResponse,
 )
+from app.schemas.mentor import (
+    ChecklistFeedbackMessageCreate,
+    ChecklistFeedbackThreadResponse,
+    ChecklistResponseSubmit,
+)
 from app.services.checklist import (
     get_fellow_checklist,
     get_fellow_checklist_reminders,
+    require_visible_fellow_checklist_item,
     update_fellow_checklist_completion,
 )
 from app.schemas.session_media import (
@@ -193,6 +209,20 @@ def get_session(
     db: Session = Depends(get_db),
 ) -> SessionDetailResponse:
     return get_session_detail(db, current_user, session_id)
+
+
+@router.get(
+    "/sessions/{session_id}/overview",
+    response_model=SessionOverviewResponse,
+    summary="Get global canonical session overview for authenticated Fellow",
+)
+def get_session_overview(
+    session_id: UUID,
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> SessionOverviewResponse:
+    return get_fellow_session_overview(db, current_user, session_id)
+
 
 @router.get(
     "/sessions/{session_id}/resources",
@@ -343,6 +373,41 @@ def get_session_feedback(
 
 
 @router.get(
+    "/sessions/{session_id}/working-board",
+    response_model=FellowWorkingBoardResponse,
+    summary="Get published Working Board for Fellow's team in a Session",
+)
+def get_session_working_board(
+    session_id: UUID,
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> FellowWorkingBoardResponse:
+    return get_fellow_working_board(
+        db=db,
+        current_user=current_user,
+        session_id=session_id,
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/working-board-insights",
+    response_model=FellowWorkingBoardInsightsResponse,
+    summary="Get published Mentor Working Board Insights for Fellow's team in a Session",
+)
+def get_session_working_board_insights(
+    session_id: UUID,
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> FellowWorkingBoardInsightsResponse:
+    return get_fellow_working_board_insights(
+        db=db,
+        current_user=current_user,
+        session_id=session_id,
+    )
+
+
+
+@router.get(
     "/company-challenge",
     response_model=CompanyChallengeResponse,
     summary="Get the authenticated Fellow's Company Challenge",
@@ -408,7 +473,7 @@ def get_checklist_reminders(
 @router.put(
     "/checklist/{item_id}/completion",
     response_model=FellowChecklistItemResponse,
-    summary="Update the authenticated Fellow's checklist completion",
+    summary="Update the authenticated Fellow's checklist completion (with optional modal response)",
 )
 def update_checklist_completion(
     item_id: UUID,
@@ -422,3 +487,113 @@ def update_checklist_completion(
         item_id,
         data.is_completed,
     )
+
+
+@router.put(
+    "/checklist/{item_id}/response",
+    response_model=FellowChecklistItemResponse,
+    summary="Submit or update My Contribution and Reflection for a checklist item",
+)
+def submit_checklist_response(
+    item_id: UUID,
+    data: ChecklistResponseSubmit,
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+) -> FellowChecklistItemResponse:
+    """Called when the fellow fills in the modal and saves."""
+    return update_fellow_checklist_completion(
+        db,
+        current_user,
+        item_id,
+        is_completed=True,
+        contribution=data.contribution,
+        reflection=data.reflection,
+        my_thoughts=data.my_thoughts,
+    )
+
+
+@router.get(
+    "/checklist/{item_id}/feedback",
+    summary="Get checklist feedback thread for this Fellow + item",
+)
+def get_checklist_feedback_thread(
+    item_id: UUID,
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+):
+    from app.services.mentor_checklist import get_feedback_thread
+    require_visible_fellow_checklist_item(db, current_user, item_id)
+    return get_feedback_thread(db, item_id=item_id, fellow_user_id=current_user.id)
+
+
+@router.post(
+    "/checklist/{item_id}/feedback",
+    status_code=201,
+    summary="Post a message in the checklist feedback thread",
+)
+def post_checklist_feedback_message(
+    item_id: UUID,
+    data: ChecklistFeedbackMessageCreate,
+    current_user: User = Depends(require_fellow_portal),
+    db: Session = Depends(get_db),
+):
+    from app.services.mentor_checklist import post_feedback_message
+    return post_feedback_message(
+        db,
+        item_id=item_id,
+        fellow_user_id=current_user.id,
+        author=current_user,
+        message=data.message,
+    )
+
+
+# ===========================================================================
+# DISCOVER -> VALIDATE Phase Gate – Fellow (read-only view)
+# ===========================================================================
+
+from app.services.phase_gate import (
+    DISCOVER_TO_VALIDATE_GATE,
+    get_gate_assessment_for_fellow,
+)
+from app.repositories.team import get_team_for_fellow
+from app.repositories.enrollment import get_active_enrollment_for_user
+from app.repositories.progression import get_team_phase_progression
+
+
+@router.get(
+    "/discover/gate-assessment",
+    summary="Fellow read-only view of submitted DISCOVER->VALIDATE gate assessment",
+)
+def fellow_get_gate_assessment(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_fellow_portal),
+):
+    enrollment = get_active_enrollment_for_user(db, current_user.id)
+    if not enrollment:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No active enrollment found.",
+        )
+    team = get_team_for_fellow(db, current_user.id, enrollment.cohort_id)
+    if not team:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Team not found.",
+        )
+    # Check if VALIDATE has been approved for this team
+    validate_progression = get_team_phase_progression(db, team.id, "VALIDATE")
+    validate_unlocked = (
+        validate_progression is not None
+        and validate_progression.status == "approved"
+    )
+
+    result = get_gate_assessment_for_fellow(db, team.id, DISCOVER_TO_VALIDATE_GATE)
+    if not result:
+        return {
+            "status": "not_submitted",
+            "message": "Gate assessment not yet submitted by your mentor.",
+            "validate_unlocked": validate_unlocked,
+        }
+
+    result["validate_unlocked"] = validate_unlocked
+    return result

@@ -75,7 +75,7 @@ from app.schemas.auth import (
     InvitationDeliveryResponse,
 )
 from app.services.auth import DuplicateEmailError, admin_create_fellow
-from app.services.invitation import replace_invitation_for_user, send_invitation_email
+from app.services.invitation import create_invitation_for_user, replace_invitation_for_user, send_invitation_email, send_mentor_invitation_email
 from app.services.google_calendar import (
     create_calendar_event_with_meet,
     update_calendar_event,
@@ -108,6 +108,12 @@ from app.services.checklist import (
     delete_admin_checklist_item,
     list_admin_checklist_items,
     update_admin_checklist_item,
+)
+from app.schemas.working_board import (
+    AdminWorkingBoardCreateRequest,
+    AdminWorkingBoardDetail,
+    AdminWorkingBoardPublicationPatchRequest,
+    AdminWorkingBoardUpdateRequest,
 )
 router = APIRouter(prefix="/admin", tags=["Admin"])
 logger = logging.getLogger(__name__)
@@ -166,11 +172,11 @@ def list_checklist_items(
 def create_checklist_item(
     data: ChecklistItemCreate,
     db: Session = Depends(get_db),
-    _admin: User = Depends(
+    admin: User = Depends(
         require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)
     ),
 ):
-    return create_admin_checklist_item(db, data)
+    return create_admin_checklist_item(db, data, created_by=admin)
 
 
 @router.put(
@@ -2639,3 +2645,543 @@ def delete_resource(
 
     db.delete(resource)
     db.commit()
+
+
+# ===========================================================================
+# MENTOR MANAGEMENT & CHECKLIST REVIEWS
+# ===========================================================================
+
+from app.models.checklist import (
+    ChecklistItem,
+    FellowChecklistCompletion,
+    MentorTeamAssignment,
+)
+from app.schemas.mentor import CreateMentorRequest, UpdateMentorRequest
+
+@router.get("/mentors", summary="List all mentors and program managers")
+def list_mentors(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    users = db.scalars(
+        select(User)
+        .where(User.role.in_([UserRole.MENTOR, UserRole.PROGRAM_MANAGER]))
+        .order_by(User.first_name, User.last_name)
+    ).all()
+    return [
+        {
+            "id": str(u.id),
+            "first_name": u.first_name,
+            "last_name": u.last_name,
+            "email": u.email,
+            "role": u.role.value if hasattr(u.role, "value") else str(u.role),
+            "account_status": u.account_status.value if hasattr(u.account_status, "value") else str(u.account_status),
+        }
+        for u in users
+    ]
+
+@router.post("/mentors", status_code=status.HTTP_201_CREATED, summary="Create a new Mentor account")
+def create_mentor(
+    data: CreateMentorRequest,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    normalized_email = data.email.strip().lower()
+    existing = db.scalar(select(User).where(User.email == normalized_email))
+    if existing:
+        raise HTTPException(status_code=409, detail=f"User with email '{normalized_email}' already exists.")
+
+    mentor = User(
+        first_name=data.first_name.strip(),
+        last_name=data.last_name.strip(),
+        email=normalized_email,
+        role=UserRole.MENTOR,
+        account_status=AccountStatus.INVITED,  # Must activate via invitation link
+        two_factor_enabled=False,
+    )
+    db.add(mentor)
+    db.flush()  # Get the mentor.id before commit so we can create the token
+
+    raw_token = create_invitation_for_user(db, mentor)
+    db.commit()
+    db.refresh(mentor)
+
+    try:
+        send_mentor_invitation_email(user=mentor, raw_token=raw_token)
+    except Exception:
+        logger.exception("Failed to send mentor invitation email to %s", mentor.email)
+
+    return {
+        "id": str(mentor.id),
+        "first_name": mentor.first_name,
+        "last_name": mentor.last_name,
+        "email": mentor.email,
+        "role": mentor.role.value if hasattr(mentor.role, "value") else str(mentor.role),
+        "account_status": mentor.account_status.value if hasattr(mentor.account_status, "value") else str(mentor.account_status),
+    }
+
+@router.post(
+    "/mentors/{mentor_id}/resend-invitation",
+    response_model=InvitationDeliveryResponse,
+    summary="Replace and resend a Mentor invitation",
+)
+def resend_mentor_invitation(
+    mentor_id: UUID,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+) -> InvitationDeliveryResponse:
+    mentor = db.get(User, mentor_id)
+    if not mentor or mentor.role not in [UserRole.MENTOR, UserRole.PROGRAM_MANAGER]:
+        raise HTTPException(status_code=404, detail="Mentor not found.")
+
+    if mentor.account_status == AccountStatus.ACTIVE and mentor.two_factor_enabled:
+        raise HTTPException(
+            status_code=409,
+            detail="Invitation cannot be resent for an account that has already completed onboarding.",
+        )
+
+    raw_token = replace_invitation_for_user(db, mentor)
+    mentor.account_status = AccountStatus.INVITED
+    mentor.password_hash = None
+    mentor.password_set_at = None
+    mentor.totp_secret = None
+    mentor.two_factor_enabled = False
+    db.commit()
+
+    try:
+        send_mentor_invitation_email(user=mentor, raw_token=raw_token)
+    except Exception:
+        logger.exception("Failed to resend mentor invitation email to user_id=%s", mentor.id)
+        return InvitationDeliveryResponse(
+            invitation_sent=False,
+            message="A replacement invitation was created, but email delivery failed.",
+        )
+
+    return InvitationDeliveryResponse(
+        invitation_sent=True,
+        message="Replacement mentor invitation email sent.",
+    )
+
+@router.get("/mentors/{mentor_id}", summary="Get mentor details with assigned teams")
+def get_mentor(
+    mentor_id: UUID,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    mentor = db.get(User, mentor_id)
+    if not mentor or mentor.role not in [UserRole.MENTOR, UserRole.PROGRAM_MANAGER]:
+        raise HTTPException(status_code=404, detail="Mentor not found.")
+
+    assignments = db.scalars(
+        select(MentorTeamAssignment).where(MentorTeamAssignment.mentor_user_id == mentor.id)
+    ).all()
+    assigned_teams = []
+    for a in assignments:
+        team = db.get(Team, a.team_id)
+        cohort = db.get(Cohort, a.cohort_id) if a.cohort_id else None
+        assigned_teams.append({
+            "assignment_id": str(a.id),
+            "team_id": str(a.team_id),
+            "team_name": team.name if team else "Unknown",
+            "cohort_id": str(a.cohort_id) if a.cohort_id else None,
+            "cohort_name": cohort.name if cohort else None,
+        })
+
+    return {
+        "id": str(mentor.id),
+        "first_name": mentor.first_name,
+        "last_name": mentor.last_name,
+        "email": mentor.email,
+        "role": mentor.role.value if hasattr(mentor.role, "value") else str(mentor.role),
+        "account_status": mentor.account_status.value if hasattr(mentor.account_status, "value") else str(mentor.account_status),
+        "assigned_teams": assigned_teams,
+    }
+
+@router.put("/mentors/{mentor_id}", summary="Update a mentor account")
+def update_mentor(
+    mentor_id: UUID,
+    data: UpdateMentorRequest,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    mentor = db.get(User, mentor_id)
+    if not mentor or mentor.role not in [UserRole.MENTOR, UserRole.PROGRAM_MANAGER]:
+        raise HTTPException(status_code=404, detail="Mentor not found.")
+
+    if data.email is not None:
+        normalized_email = data.email.strip().lower()
+        if normalized_email != mentor.email.lower():
+            existing = db.scalar(select(User).where(User.email == normalized_email))
+            if existing:
+                raise HTTPException(status_code=409, detail=f"User with email '{normalized_email}' already exists.")
+            mentor.email = normalized_email
+
+    if data.first_name is not None:
+        mentor.first_name = data.first_name.strip()
+    if data.last_name is not None:
+        mentor.last_name = data.last_name.strip()
+
+    if data.role is not None:
+        role_str = data.role.strip().lower()
+        if role_str in ("mentor", "program_manager"):
+            mentor.role = UserRole(role_str)
+        else:
+            raise HTTPException(status_code=422, detail="Role must be either 'mentor' or 'program_manager'.")
+
+    if data.account_status is not None:
+        status_str = data.account_status.strip().lower()
+        try:
+            mentor.account_status = AccountStatus(status_str)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Invalid account status '{status_str}'.")
+
+    db.commit()
+    db.refresh(mentor)
+    return {
+        "id": str(mentor.id),
+        "first_name": mentor.first_name,
+        "last_name": mentor.last_name,
+        "email": mentor.email,
+        "role": mentor.role.value if hasattr(mentor.role, "value") else str(mentor.role),
+        "account_status": mentor.account_status.value if hasattr(mentor.account_status, "value") else str(mentor.account_status),
+    }
+
+@router.delete("/mentors/{mentor_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete or deactivate a mentor")
+def delete_mentor(
+    mentor_id: UUID,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    mentor = db.get(User, mentor_id)
+    if not mentor or mentor.role not in [UserRole.MENTOR, UserRole.PROGRAM_MANAGER]:
+        raise HTTPException(status_code=404, detail="Mentor not found.")
+
+    # Remove all mentor team assignments first
+    assignments = db.scalars(
+        select(MentorTeamAssignment).where(MentorTeamAssignment.mentor_user_id == mentor.id)
+    ).all()
+    for a in assignments:
+        db.delete(a)
+
+    try:
+        db.delete(mentor)
+        db.commit()
+    except Exception:
+        db.rollback()
+        # Fallback to suspension if referenced by foreign keys (e.g., historical reviews)
+        mentor = db.get(User, mentor_id)
+        if mentor:
+            mentor.account_status = AccountStatus.SUSPENDED
+            db.commit()
+
+
+@router.get("/mentor-assignments", summary="List all Mentor to Team assignments")
+def list_mentor_assignments(
+    cohort_id: str | None = None,
+    team_id: str | None = None,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    stmt = select(MentorTeamAssignment).order_by(MentorTeamAssignment.created_at.desc())
+    if cohort_id:
+        stmt = stmt.where(MentorTeamAssignment.cohort_id == cohort_id)
+    if team_id:
+        stmt = stmt.where(MentorTeamAssignment.team_id == team_id)
+    assignments = db.scalars(stmt).all()
+
+    result = []
+    for a in assignments:
+        mentor = db.get(User, a.mentor_user_id)
+        team = db.get(Team, a.team_id)
+        cohort = db.get(Cohort, a.cohort_id)
+        result.append({
+            "id": str(a.id),
+            "mentor_user_id": str(a.mentor_user_id),
+            "mentor_name": f"{mentor.first_name} {mentor.last_name}".strip() if mentor else "Unknown",
+            "mentor_email": mentor.email if mentor else "",
+            "team_id": str(a.team_id),
+            "team_name": team.name if team else "Unknown",
+            "cohort_id": str(a.cohort_id),
+            "cohort_name": cohort.name if cohort else "Unknown",
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+        })
+    return result
+
+@router.post("/mentor-assignments", status_code=status.HTTP_201_CREATED, summary="Assign a Mentor to a Team")
+def create_mentor_assignment(
+    data: dict,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    mentor_user_id = data.get("mentor_user_id")
+    team_id = data.get("team_id")
+    if not mentor_user_id or not team_id:
+        raise HTTPException(status_code=422, detail="mentor_user_id and team_id are required.")
+
+    team = db.get(Team, team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found.")
+
+    mentor = db.get(User, mentor_user_id)
+    if not mentor:
+        raise HTTPException(status_code=404, detail="Mentor not found.")
+
+    existing = db.scalar(
+        select(MentorTeamAssignment).where(
+            MentorTeamAssignment.mentor_user_id == mentor.id,
+            MentorTeamAssignment.team_id == team.id,
+        )
+    )
+    if existing:
+        return {
+            "id": str(existing.id),
+            "mentor_user_id": str(existing.mentor_user_id),
+            "team_id": str(existing.team_id),
+            "cohort_id": str(existing.cohort_id),
+        }
+
+    assignment = MentorTeamAssignment(
+        mentor_user_id=mentor.id,
+        team_id=team.id,
+        cohort_id=team.cohort_id,
+    )
+    db.add(assignment)
+    db.commit()
+    db.refresh(assignment)
+    return {
+        "id": str(assignment.id),
+        "mentor_user_id": str(assignment.mentor_user_id),
+        "team_id": str(assignment.team_id),
+        "cohort_id": str(assignment.cohort_id),
+    }
+
+@router.delete("/mentor-assignments/{assignment_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Remove a Mentor assignment")
+def delete_mentor_assignment(
+    assignment_id: str,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    assignment = db.scalar(select(MentorTeamAssignment).where(MentorTeamAssignment.id == assignment_id))
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Assignment not found.")
+    db.delete(assignment)
+    db.commit()
+
+@router.get("/checklist-reviews", summary="View fellow checklist statuses and mentor reviews")
+def list_checklist_reviews(
+    cohort_id: str | None = None,
+    session_id: str | None = None,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    stmt = select(FellowChecklistCompletion).order_by(FellowChecklistCompletion.updated_at.desc())
+    completions = db.scalars(stmt).all()
+    result = []
+    for c in completions:
+        item = db.get(ChecklistItem, c.checklist_item_id)
+        if not item:
+            continue
+        if session_id and str(item.session_id) != session_id:
+            continue
+        if cohort_id and str(item.cohort_id) != cohort_id:
+            continue
+
+        fellow = db.get(User, c.user_id)
+        reviewer = db.get(User, c.reviewed_by_mentor_id) if c.reviewed_by_mentor_id else None
+
+        tm = db.scalar(select(TeamMembership).where(TeamMembership.user_id == c.user_id))
+        team = db.get(Team, tm.team_id) if tm else None
+        cohort = db.get(Cohort, team.cohort_id) if team and team.cohort_id else (db.get(Cohort, item.cohort_id) if item.cohort_id else None)
+        session_obj = db.get(DBSession, item.session_id) if item.session_id else None
+
+        result.append({
+            "id": str(c.id),
+            "fellow_user_id": str(c.user_id),
+            "fellow_name": f"{fellow.first_name} {fellow.last_name}".strip() if fellow else "Unknown",
+            "fellow_email": fellow.email if fellow else "",
+            "team_id": str(team.id) if team else None,
+            "team_name": team.name if team else None,
+            "cohort_name": cohort.name if cohort else None,
+            "session_name": session_obj.title if session_obj else None,
+            "checklist_item_id": str(item.id),
+            "checklist_item_title": item.title,
+            "is_completed": c.is_completed,
+            "completed_at": c.completed_at.isoformat() if c.completed_at else None,
+            "review_status": c.review_status.value if hasattr(c.review_status, "value") else str(c.review_status),
+            "reviewed_by_name": f"{reviewer.first_name} {reviewer.last_name}".strip() if reviewer else None,
+            "reviewed_at": c.reviewed_at.isoformat() if c.reviewed_at else None,
+            "contribution": c.contribution,
+            "reflection": c.reflection,
+            "rejection_reason": c.rejection_reason,
+        })
+    return result
+
+
+# ===========================================================================
+# Admin Working Board Management
+# ===========================================================================
+
+
+@router.get(
+    "/working-boards",
+    response_model=list[AdminWorkingBoardDetail],
+    summary="List Working Boards with optional session, team, or cohort filter",
+)
+def admin_list_working_boards(
+    session_id: UUID | None = None,
+    team_id: UUID | None = None,
+    cohort_id: UUID | None = None,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+) -> list[AdminWorkingBoardDetail]:
+    from app.services.working_board import list_admin_working_boards
+
+    return list_admin_working_boards(
+        db=db,
+        session_id=session_id,
+        team_id=team_id,
+        cohort_id=cohort_id,
+    )
+
+
+@router.post(
+    "/working-boards",
+    response_model=AdminWorkingBoardDetail,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new Working Board for a team and session",
+)
+def admin_create_working_board(
+    data: AdminWorkingBoardCreateRequest,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+) -> AdminWorkingBoardDetail:
+    from app.services.working_board import create_admin_working_board
+
+    return create_admin_working_board(
+        db=db,
+        admin_user=admin_user,
+        data=data,
+    )
+
+
+@router.get(
+    "/working-boards/{board_id}",
+    response_model=AdminWorkingBoardDetail,
+    summary="Get single Working Board detail",
+)
+def admin_get_working_board(
+    board_id: UUID,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+) -> AdminWorkingBoardDetail:
+    from app.services.working_board import get_admin_working_board
+
+    return get_admin_working_board(db=db, board_id=board_id)
+
+
+@router.put(
+    "/working-boards/{board_id}",
+    response_model=AdminWorkingBoardDetail,
+    summary="Update Working Board title, link, instructions, or publication state",
+)
+def admin_update_working_board(
+    board_id: UUID,
+    data: AdminWorkingBoardUpdateRequest,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+) -> AdminWorkingBoardDetail:
+    from app.services.working_board import update_admin_working_board
+
+    return update_admin_working_board(
+        db=db,
+        admin_user=admin_user,
+        board_id=board_id,
+        data=data,
+    )
+
+
+@router.patch(
+    "/working-boards/{board_id}/publication",
+    response_model=AdminWorkingBoardDetail,
+    summary="Toggle publication state of a Working Board",
+)
+def admin_patch_working_board_publication(
+    board_id: UUID,
+    data: AdminWorkingBoardPublicationPatchRequest,
+    db: Session = Depends(get_db),
+    admin_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+) -> AdminWorkingBoardDetail:
+    from app.services.working_board import patch_admin_working_board_publication
+
+    return patch_admin_working_board_publication(
+        db=db,
+        admin_user=admin_user,
+        board_id=board_id,
+        is_published=data.is_published,
+    )
+
+
+# ===========================================================================
+# DISCOVER -> VALIDATE Phase Gate – Admin (review & unlock)
+# ===========================================================================
+
+from app.services.phase_gate import (
+    DISCOVER_TO_VALIDATE_GATE,
+    list_gate_assessments_for_admin,
+    unlock_validate_and_notify,
+)
+
+
+@router.get(
+    "/phase-gates/discover-to-validate",
+    summary="Admin: List all submitted DISCOVER->VALIDATE assessments",
+)
+def admin_list_gate_assessments(
+    cohort_id: UUID | None = None,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    return list_gate_assessments_for_admin(db, DISCOVER_TO_VALIDATE_GATE, cohort_id)
+
+
+@router.get(
+    "/phase-gates/discover-to-validate/{team_id}",
+    summary="Admin: Get DISCOVER->VALIDATE gate assessment for a specific team",
+)
+def admin_get_team_gate_assessment(
+    team_id: UUID,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    from app.services.phase_gate import get_gate_assessment_for_fellow
+    # Admin sees even submitted (use the same fetch, no status filter needed for admin)
+    from app.models.phase_gate import PhaseGateAssessment
+    from app.services.phase_gate import serialize_assessment
+    assessment = db.scalar(
+        select(PhaseGateAssessment).where(
+            PhaseGateAssessment.team_id == team_id,
+            PhaseGateAssessment.phase_gate_code == DISCOVER_TO_VALIDATE_GATE,
+        )
+    )
+    if not assessment:
+        raise _not_found("Gate assessment", team_id)
+    return serialize_assessment(assessment)
+
+
+@router.post(
+    "/phase-gates/discover-to-validate/{team_id}/unlock-validate",
+    summary="Admin: Unlock VALIDATE phase for a team and send congratulations emails",
+    status_code=status.HTTP_200_OK,
+)
+def admin_unlock_validate(
+    team_id: UUID,
+    payload: dict = {},
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_roles(UserRole.ADMIN, UserRole.SUPER_ADMIN)),
+):
+    return unlock_validate_and_notify(
+        db=db,
+        team_id=team_id,
+        admin_user_id=current_admin.id,
+        admin_notes=payload.get("notes") if payload else None,
+    )

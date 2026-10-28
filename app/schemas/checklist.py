@@ -33,10 +33,12 @@ def validate_checklist_action_url(value: object) -> str | None:
 
 
 class ChecklistItemCreate(BaseModel):
+    team_id: UUID | None = None
     cohort_id: UUID | None = None
     phase_id: UUID | None = None
     week_id: UUID | None = None
     session_id: UUID | None = None
+    required_submission_session_id: UUID | None = None
     title: str = Field(..., min_length=1, max_length=300)
     description: str | None = Field(None, max_length=5000)
     category: str | None = Field(None, max_length=100)
@@ -53,10 +55,12 @@ class ChecklistItemCreate(BaseModel):
 
 
 class ChecklistItemUpdate(BaseModel):
+    team_id: UUID | None = None
     cohort_id: UUID | None = None
     phase_id: UUID | None = None
     week_id: UUID | None = None
     session_id: UUID | None = None
+    required_submission_session_id: UUID | None = None
     title: str | None = Field(None, min_length=1, max_length=300)
     description: str | None = Field(None, max_length=5000)
     category: str | None = Field(None, max_length=100)
@@ -74,10 +78,60 @@ class ChecklistItemUpdate(BaseModel):
 
 class AdminChecklistItemResponse(ChecklistItemCreate):
     id: UUID
+    session_number: int | None = None  # global session-number-scoped items
+    is_system: bool = False             # system-defined, protected from CRUD
+    created_by_user_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class MentorChecklistItemCreate(BaseModel):
+    team_id: UUID
+    phase_id: UUID
+    week_id: UUID
+    session_id: UUID
+    title: str = Field(..., min_length=1, max_length=300)
+    description: str | None = Field(None, max_length=5000)
+    due_at: datetime | None = None
+    action_label: str | None = Field(None, max_length=100)
+    action_url: str | None = Field(None, max_length=1000)
+    is_required: bool = True
+    is_active: bool = True
+    sequence: int = Field(0, ge=0)
+
+    _validate_action_url = field_validator("action_url", mode="before")(
+        validate_checklist_action_url
+    )
+
+
+class MentorChecklistItemUpdate(BaseModel):
+    phase_id: UUID | None = None
+    week_id: UUID | None = None
+    session_id: UUID | None = None
+    title: str | None = Field(None, min_length=1, max_length=300)
+    description: str | None = Field(None, max_length=5000)
+    due_at: datetime | None = None
+    action_label: str | None = Field(None, max_length=100)
+    action_url: str | None = Field(None, max_length=1000)
+    is_required: bool | None = None
+    sequence: int | None = Field(None, ge=0)
+
+    _validate_action_url = field_validator("action_url", mode="before")(
+        validate_checklist_action_url
+    )
+
+
+class ChecklistActivationUpdate(BaseModel):
+    is_active: bool
+
+
+class MentorChecklistItemResponse(AdminChecklistItemResponse):
+    applicable_team_id: UUID
+    applicable_team_name: str
+    creator_name: str | None = None
+    can_edit: bool
 
 
 class FellowChecklistItemResponse(BaseModel):
@@ -88,8 +142,21 @@ class FellowChecklistItemResponse(BaseModel):
     due_at: datetime | None
     status: ChecklistStatus
     is_required: bool
+    is_submitted: bool
     is_completed: bool
     completed_at: datetime | None
+    # Review workflow fields
+    contribution: str | None = None
+    reflection: str | None = None
+    my_thoughts: str | None = None
+    review_status: str = "not_checked"
+    rejection_reason: str | None = None
+    reviewed_at: datetime | None = None
+    session_id: UUID | None = None
+    session_name: str | None = None
+    session_number: int | None = None  # populated for session-number-scoped items
+    week_number: int | None = None
+    cohort_name: str | None = None
     action_label: str | None
     action_url: str | None
     sequence: int

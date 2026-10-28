@@ -119,6 +119,12 @@ class Team(Base):
         cascade="all, delete-orphan",
     )
 
+    mentor_assignments = relationship(
+        "MentorTeamAssignment",
+        back_populates="team",
+        cascade="all, delete-orphan",
+    )
+
 
 class TeamMembership(Base):
     """

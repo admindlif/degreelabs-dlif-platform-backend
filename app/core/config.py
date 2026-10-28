@@ -34,6 +34,7 @@ class Settings(BaseSettings):
 
     # Frontend
     frontend_base_url: str = Field(min_length=1)
+    mentor_frontend_base_url: str = Field(default="http://localhost:3003", min_length=1)
     cors_allowed_origins: str | None = None
 
     # Email
@@ -91,12 +92,15 @@ class Settings(BaseSettings):
         if configured:
             candidates = configured.split(",")
         elif self.environment.strip().lower() == "production":
-            candidates = [self.frontend_base_url]
+            candidates = [self.frontend_base_url, self.mentor_frontend_base_url]
         else:
             candidates = [
                 self.frontend_base_url,
+                self.mentor_frontend_base_url,
                 "http://localhost:3000",
+                "http://localhost:3001",
                 "http://localhost:3002",
+                "http://localhost:3003",
             ]
 
         # Preserve order while removing whitespace, trailing slashes, and dupes.
@@ -131,6 +135,7 @@ class Settings(BaseSettings):
 
         for label, origin in [
             ("FRONTEND_BASE_URL", self.frontend_base_url),
+            ("MENTOR_FRONTEND_BASE_URL", self.mentor_frontend_base_url),
             *(("CORS_ALLOWED_ORIGINS", item) for item in self.allowed_origins),
         ]:
             parsed = urlsplit(origin)

@@ -204,3 +204,125 @@ The DegreeLabs Team
         html_body=html_body,
         text_body=text_body,
     )
+
+
+def send_mentor_invitation_email(
+    *,
+    user: User,
+    raw_token: str,
+) -> None:
+    """
+    Send the account activation email to an invited Mentor / Program Manager.
+
+    Uses the same activation endpoint as the Fellow invitation so the
+    auth flow is identical.  Only the copy and subject line differ.
+    """
+    base_url = (
+        getattr(settings, "mentor_frontend_base_url", None)
+        or settings.frontend_base_url
+    )
+    activation_url = (
+        f"{base_url}/activate?token={raw_token}"
+    )
+
+    role_label = "Program Manager" if getattr(user, "role", None) and user.role.value == "program_manager" else "Mentor"
+
+    subject = f"You've been invited to DegreeLabs DLIF as a {role_label}"
+
+    text_body = f"""\
+Hi {user.first_name},
+
+You have been added to the DegreeLabs Impact Fellowship platform as a {role_label}.
+
+Activate your account and create your password by visiting:
+
+  {activation_url}
+
+This link expires in {settings.invitation_token_expire_hours} hours.
+
+If you weren't expecting this invitation, please contact your programme administrator.
+
+The DegreeLabs Team
+"""
+
+    logo_url = settings.email_logo_url
+    if not logo_url:
+        if settings.frontend_base_url.startswith("https://"):
+            logo_url = f"{settings.frontend_base_url.rstrip('/')}/degreelabs-logo.png"
+        else:
+            logo_url = "https://framerusercontent.com/images/wQtZcQz0JelTmeZro2xPdEUWPwI.png"
+
+    html_body = f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DegreeLabs DLIF {role_label} Invitation</title>
+</head>
+<body style="font-family:sans-serif;color:#1a1a1a;background:#ffffff;margin:0;padding:0;">
+  <table width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td align="center" style="padding:48px 16px;">
+        <table width="560" cellpadding="0" cellspacing="0"
+               style="background:#ffffff;border:1px solid #e5e5e5;border-radius:8px;overflow:hidden;">
+          <!-- Header -->
+          <tr>
+            <td style="background:#ffffff;padding:32px 40px 24px;border-bottom:1px solid #f3f4f6;">
+              <img src="{logo_url}"
+                   alt="DegreeLabs"
+                   width="150"
+                   height="32"
+                   style="display:block;width:150px;max-width:150px;height:auto;border:0;outline:none;text-decoration:none;" />
+            </td>
+          </tr>
+          <!-- Body -->
+          <tr>
+            <td style="padding:40px 40px 32px;">
+              <h1 style="margin:0 0 16px;font-size:24px;font-weight:700;color:#0f172a;">
+                Welcome to DLIF, {role_label} {user.first_name}!
+              </h1>
+              <p style="margin:0 0 24px;font-size:15px;line-height:1.6;color:#374151;">
+                You have been added to the DegreeLabs Impact Fellowship platform as a <strong>{role_label}</strong>.
+                Activate your account and create your password to get started.
+              </p>
+              <!-- CTA -->
+              <table cellpadding="0" cellspacing="0">
+                <tr>
+                  <td style="border-radius:6px;background:#0f172a;">
+                    <a href="{activation_url}"
+                       style="display:inline-block;padding:14px 28px;font-size:15px;
+                              font-weight:600;color:#ffffff;text-decoration:none;
+                              border-radius:6px;">
+                      Activate Account
+                    </a>
+                  </td>
+                </tr>
+              </table>
+              <p style="margin:24px 0 0;font-size:13px;color:#6b7280;">
+                This link expires in {settings.invitation_token_expire_hours} hours.
+                If you weren't expecting this invitation, please ignore this email.
+              </p>
+            </td>
+          </tr>
+          <!-- Footer -->
+          <tr>
+            <td style="padding:24px 40px;border-top:1px solid #f3f4f6;">
+              <p style="margin:0;font-size:12px;color:#9ca3af;">
+                DegreeLabs &middot; Questions? Contact your programme administrator.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"""
+
+    send_email(
+        to_address=user.email,
+        subject=subject,
+        html_body=html_body,
+        text_body=text_body,
+    )

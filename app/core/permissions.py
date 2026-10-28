@@ -21,6 +21,7 @@ supported as a temporary compatibility fallback for existing API consumers.
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 import jwt
@@ -224,6 +225,22 @@ def require_authenticated_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account setup is incomplete.",
         )
+
+    if user.password_set_at is not None and token is not None:
+        try:
+            payload = decode_access_token(token)
+            if "iat" in payload:
+                token_iat_ts = float(payload["iat"])
+                if token_iat_ts < user.password_set_at.timestamp():
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Session has been revoked due to a password change. Please sign in again.",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
 
     return user
 

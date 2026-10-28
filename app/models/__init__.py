@@ -1,4 +1,4 @@
-from app.models.cohort import Cohort, CohortStatus
+﻿from app.models.cohort import Cohort, CohortStatus
 from app.models.enrollment import Enrollment, EnrollmentStatus
 from app.models.phase import Phase
 from app.models.program import Program
@@ -13,6 +13,8 @@ from app.models.submission import TeamSubmission
 from app.models.feedback import SubmissionFeedback
 from app.models.checklist import ChecklistItem, FellowChecklistCompletion
 from app.models.progression import TeamPhaseProgression
+from app.models.password_recovery import PasswordRecoveryRequest
+from app.models.phase_gate import PhaseGateAssessment, PhaseGateDimensionResult, DISCOVER_TO_VALIDATE_GATE
 
 __all__ = [
     "User",
@@ -41,4 +43,5 @@ __all__ = [
     "ChecklistItem",
     "FellowChecklistCompletion",
     "TeamPhaseProgression",
+    "PasswordRecoveryRequest",
 ]

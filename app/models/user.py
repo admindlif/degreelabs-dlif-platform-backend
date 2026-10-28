@@ -19,6 +19,7 @@ from app.db.base import Base
 if TYPE_CHECKING:
     from app.models.user_invitation import UserInvitationToken
     from app.models.user_recovery_code import UserRecoveryCode
+    from app.models.password_recovery import PasswordRecoveryRequest
 class UserRole(str, Enum):
     SUPER_ADMIN = "super_admin"
     ADMIN = "admin"
@@ -142,6 +143,12 @@ class User(Base):
 
     recovery_codes: Mapped[list["UserRecoveryCode"]] = relationship(  # noqa: F821
         "UserRecoveryCode",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+    password_recovery_requests: Mapped[list["PasswordRecoveryRequest"]] = relationship(  # noqa: F821
+        "PasswordRecoveryRequest",
         back_populates="user",
         cascade="all, delete-orphan",
     )

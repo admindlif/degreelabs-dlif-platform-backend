@@ -1,192 +1,87 @@
-"""
-Tests for Phase B portal auth isolation.
+"""Role isolation tests for the current monolithic portal API.
 
-Verifies that:
-- Each portal runtime only accepts tokens with the allowed role(s).
-- Cross-portal token access is strictly rejected with HTTP 403.
+The project previously collected three ``apps.*`` ASGI applications that no
+longer exist.  Portal isolation now lives in route dependencies on the shared
+FastAPI application, so these tests exercise the real mounted routes.
 """
 
-import sys
-from pathlib import Path
 from uuid import uuid4
 
-# Ensure repo root is on sys.path so apps.* is importable
-repo_root = Path(__file__).resolve().parent.parent.parent
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
-
 import pytest
-from starlette.testclient import TestClient
+from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.core.security import create_access_token, hash_password
-from app.models.user import User, UserRole, AccountStatus
-from apps.student_api.main import app as student_app
-from apps.mentor_api.main import app as mentor_app
-from apps.admin_api.main import app as admin_app
+from app.models.user import AccountStatus, User, UserRole
+
+
+def _headers(user: User) -> dict[str, str]:
+    token = create_access_token(str(user.id), role=user.role.value)
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture
-def student_client():
-    return TestClient(student_app)
-
-
-@pytest.fixture
-def mentor_client():
-    return TestClient(mentor_app)
-
-
-@pytest.fixture
-def admin_client():
-    return TestClient(admin_app)
-
-
-@pytest.fixture
-def student_user(db: Session) -> User:
-    email = f"student_{uuid4().hex[:8]}@degreelabs.com"
-    user = User(
-        first_name="Alice",
-        last_name="Student",
-        email=email,
-        password_hash=hash_password("Pass12345!"),
-        role=UserRole.STUDENT,
-        account_status=AccountStatus.ACTIVE,
-        is_active=True,
-    )
-    db.add(user)
+def portal_users(db: Session):
+    suffix = uuid4().hex[:8]
+    users = {
+        "fellow": User(
+            first_name="Alice",
+            last_name="Fellow",
+            email=f"fellow_{suffix}@degreelabs.com",
+            password_hash=hash_password("Pass12345!"),
+            role=UserRole.FELLOW,
+            account_status=AccountStatus.ACTIVE,
+            is_active=True,
+        ),
+        "mentor": User(
+            first_name="Bob",
+            last_name="Mentor",
+            email=f"mentor_{suffix}@degreelabs.com",
+            password_hash=hash_password("Pass12345!"),
+            role=UserRole.MENTOR,
+            account_status=AccountStatus.ACTIVE,
+            is_active=True,
+        ),
+        "admin": User(
+            first_name="Carol",
+            last_name="Admin",
+            email=f"admin_{suffix}@degreelabs.com",
+            password_hash=hash_password("Pass12345!"),
+            role=UserRole.ADMIN,
+            account_status=AccountStatus.ACTIVE,
+            is_active=True,
+        ),
+    }
+    db.add_all(users.values())
     db.commit()
-    db.refresh(user)
-    yield user
-    db.delete(user)
-    db.commit()
-
-
-@pytest.fixture
-def mentor_user(db: Session) -> User:
-    email = f"mentor_{uuid4().hex[:8]}@degreelabs.com"
-    user = User(
-        first_name="Bob",
-        last_name="Mentor",
-        email=email,
-        password_hash=hash_password("Pass12345!"),
-        role=UserRole.MENTOR,
-        account_status=AccountStatus.ACTIVE,
-        is_active=True,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    yield user
-    db.delete(user)
+    yield users
+    db.execute(delete(User).where(User.id.in_([user.id for user in users.values()])))
     db.commit()
 
 
-def test_student_portal_allows_student_and_rejects_others(
-    student_client: TestClient,
-    student_user: User,
-    mentor_user: User,
-    admin_user: User,
-):
-    student_token = create_access_token(str(student_user.id), role=student_user.role)
-    mentor_token = create_access_token(str(mentor_user.id), role=mentor_user.role)
-    admin_token = create_access_token(str(admin_user.id), role=admin_user.role)
+def test_fellow_portal_rejects_mentor_and_admin(client, portal_users):
+    route = "/api/v1/fellow/context"
 
-    # 1. Student accesses student portal /me -> 200
-    res = student_client.get(
-        "/api/v1/student-portal/me",
-        headers={"Authorization": f"Bearer {student_token}"},
-    )
-    assert res.status_code == 200
-    data = res.json()
-    assert data["email"] == student_user.email
-    assert data["role"].lower() in {"fellow", "student"}
-
-    # 2. Mentor tries student portal /me -> 403
-    res_mentor = student_client.get(
-        "/api/v1/student-portal/me",
-        headers={"Authorization": f"Bearer {mentor_token}"},
-    )
-    assert res_mentor.status_code == 403
-    assert "restricted to the" in res_mentor.json()["detail"]
-
-    # 3. Admin tries student portal /me -> 403
-    res_admin = student_client.get(
-        "/api/v1/student-portal/me",
-        headers={"Authorization": f"Bearer {admin_token}"},
-    )
-    assert res_admin.status_code == 403
-    assert "restricted to the" in res_admin.json()["detail"]
+    # The Fellow passes role authorization.  With no enrollment fixture, the
+    # route correctly reaches business validation and returns 404, not 403.
+    assert client.get(route, headers=_headers(portal_users["fellow"])).status_code == 404
+    assert client.get(route, headers=_headers(portal_users["mentor"])).status_code == 403
+    assert client.get(route, headers=_headers(portal_users["admin"])).status_code == 403
 
 
-def test_mentor_portal_allows_mentor_and_rejects_others(
-    mentor_client: TestClient,
-    student_user: User,
-    mentor_user: User,
-    admin_user: User,
-):
-    student_token = create_access_token(str(student_user.id), role=student_user.role)
-    mentor_token = create_access_token(str(mentor_user.id), role=mentor_user.role)
-    admin_token = create_access_token(str(admin_user.id), role=admin_user.role)
+def test_mentor_portal_allows_mentor_and_rejects_other_roles(client, portal_users):
+    route = "/api/v1/mentor/me"
 
-    # 1. Mentor accesses mentor portal /me -> 200
-    res = mentor_client.get(
-        "/api/v1/mentor-portal/me",
-        headers={"Authorization": f"Bearer {mentor_token}"},
-    )
-    assert res.status_code == 200
-    data = res.json()
-    assert data["email"] == mentor_user.email
-    assert data["role"].lower() == "mentor"
-
-    # 2. Student tries mentor portal /me -> 403
-    res_student = mentor_client.get(
-        "/api/v1/mentor-portal/me",
-        headers={"Authorization": f"Bearer {student_token}"},
-    )
-    assert res_student.status_code == 403
-    assert "restricted to the Mentor Portal" in res_student.json()["detail"]
-
-    # 3. Admin tries mentor portal /me -> 403
-    res_admin = mentor_client.get(
-        "/api/v1/mentor-portal/me",
-        headers={"Authorization": f"Bearer {admin_token}"},
-    )
-    assert res_admin.status_code == 403
-    assert "restricted to the Mentor Portal" in res_admin.json()["detail"]
+    response = client.get(route, headers=_headers(portal_users["mentor"]))
+    assert response.status_code == 200
+    assert response.json()["email"] == portal_users["mentor"].email
+    assert client.get(route, headers=_headers(portal_users["fellow"])).status_code == 403
+    assert client.get(route, headers=_headers(portal_users["admin"])).status_code == 403
 
 
-def test_admin_portal_allows_admin_and_rejects_others(
-    admin_client: TestClient,
-    student_user: User,
-    mentor_user: User,
-    admin_user: User,
-):
-    student_token = create_access_token(str(student_user.id), role=student_user.role)
-    mentor_token = create_access_token(str(mentor_user.id), role=mentor_user.role)
-    admin_token = create_access_token(str(admin_user.id), role=admin_user.role)
+def test_admin_portal_allows_admin_and_rejects_other_roles(client, portal_users):
+    route = "/api/v1/admin/stats"
 
-    # 1. Admin accesses admin portal /me -> 200
-    res = admin_client.get(
-        "/api/v1/admin-portal/me",
-        headers={"Authorization": f"Bearer {admin_token}"},
-    )
-    assert res.status_code == 200
-    data = res.json()
-    assert data["email"] == admin_user.email
-    assert data["role"].lower() == "admin"
-
-    # 2. Student tries admin portal /me -> 403
-    res_student = admin_client.get(
-        "/api/v1/admin-portal/me",
-        headers={"Authorization": f"Bearer {student_token}"},
-    )
-    assert res_student.status_code == 403
-    assert "restricted to the Admin Portal" in res_student.json()["detail"]
-
-    # 3. Mentor tries admin portal /me -> 403
-    res_mentor = admin_client.get(
-        "/api/v1/admin-portal/me",
-        headers={"Authorization": f"Bearer {mentor_token}"},
-    )
-    assert res_mentor.status_code == 403
-    assert "restricted to the Admin Portal" in res_mentor.json()["detail"]
+    assert client.get(route, headers=_headers(portal_users["admin"])).status_code == 200
+    assert client.get(route, headers=_headers(portal_users["fellow"])).status_code == 403
+    assert client.get(route, headers=_headers(portal_users["mentor"])).status_code == 403

@@ -357,3 +357,158 @@ def me(
     """Return the current profile without exposing authentication secrets."""
     _prevent_caching(response)
     return UserResponse.model_validate(current_user)
+
+
+# ---------------------------------------------------------------------------
+# Password Reset / Self-Service Recovery Routes
+# ---------------------------------------------------------------------------
+
+from app.schemas.auth import (
+    PasswordResetConfirmRequest,
+    PasswordResetConfirmResponse,
+    PasswordResetRequest,
+    PasswordResetRequestResponse,
+    PasswordResetResendRequest,
+    PasswordResetVerifyRequest,
+    PasswordResetVerifyResponse,
+)
+from app.services.password_recovery import (
+    InvalidRecoveryCodeError,
+    InvalidResetAuthorizationError,
+    RateLimitError,
+    RecoveryAttemptLimitError,
+    WeakPasswordError as RecoveryWeakPasswordError,
+    confirm_password_reset,
+    request_password_recovery,
+    resend_password_recovery_code,
+    verify_password_recovery_code,
+)
+
+
+@router.post(
+    "/password-reset/request",
+    response_model=PasswordResetRequestResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Request a password recovery code via email",
+)
+def password_reset_request(
+    data: PasswordResetRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> PasswordResetRequestResponse:
+    """
+    Initiate a password recovery request.
+    Always returns a generic, non-enumerating message and recovery request ID.
+    """
+    _prevent_caching(response)
+    message, request_id = request_password_recovery(
+        db,
+        email=str(data.email),
+        portal=data.portal,
+    )
+    return PasswordResetRequestResponse(
+        message=message,
+        recovery_request_id=request_id,
+    )
+
+
+@router.post(
+    "/password-reset/verify",
+    response_model=PasswordResetVerifyResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Verify the 8-digit email recovery code",
+)
+def password_reset_verify(
+    data: PasswordResetVerifyRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> PasswordResetVerifyResponse:
+    """
+    Validate the 8-digit verification code.
+    On success, returns a single-purpose, short-lived reset authorization token.
+    """
+    _prevent_caching(response)
+    try:
+        reset_token = verify_password_recovery_code(
+            db,
+            recovery_request_id=data.recovery_request_id,
+            code=data.code,
+        )
+    except RecoveryAttemptLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+        ) from exc
+    except InvalidRecoveryCodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    return PasswordResetVerifyResponse(
+        reset_authorization=reset_token,
+    )
+
+
+@router.post(
+    "/password-reset/resend",
+    response_model=AuthenticationResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Resend verification code for an existing recovery request",
+)
+def password_reset_resend(
+    data: PasswordResetResendRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> AuthenticationResponse:
+    """Resend recovery code, subject to cooldown limits."""
+    _prevent_caching(response)
+    try:
+        msg = resend_password_recovery_code(
+            db,
+            recovery_request_id=data.recovery_request_id,
+        )
+    except RateLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+        ) from exc
+
+    return AuthenticationResponse(message=msg)
+
+
+@router.post(
+    "/password-reset/confirm",
+    response_model=PasswordResetConfirmResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Set new password using single-use reset authorization",
+)
+def password_reset_confirm(
+    data: PasswordResetConfirmRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> PasswordResetConfirmResponse:
+    """
+    Apply new password, atomically consume reset authorization,
+    invalidate existing login sessions, and send confirmation email.
+    """
+    _prevent_caching(response)
+    try:
+        msg = confirm_password_reset(
+            db,
+            reset_authorization=data.reset_authorization,
+            new_password=data.new_password,
+            confirm_password=data.confirm_password,
+        )
+    except RecoveryWeakPasswordError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except InvalidResetAuthorizationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    return PasswordResetConfirmResponse(message=msg)

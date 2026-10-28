@@ -234,6 +234,23 @@ def upsert_fellow_session_submission(
     db.commit()
     db.refresh(submission)
 
+    # Notify assigned mentors (email failure must not block the submission)
+    try:
+        from app.services.mentor_checklist import send_submission_notification_to_mentors
+        send_submission_notification_to_mentors(
+            db=db,
+            team_id=membership.team_id,
+            session_id=session.id,
+            submitted_by=current_user,
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "Failed to notify mentors of submission for team=%s session=%s",
+            membership.team_id,
+            session.id,
+        )
+
     return SessionSubmissionResponse(
         submission=(
             TeamSubmissionDetail.model_validate(

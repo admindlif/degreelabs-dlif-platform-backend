@@ -158,3 +158,47 @@ class RegisterRequest(BaseModel):
     last_name: str = Field(min_length=1, max_length=100)
     email: EmailStr
     password: str = Field(min_length=8, max_length=128)
+
+
+# ---------------------------------------------------------------------------
+# Password Reset / Self-Service Recovery
+# ---------------------------------------------------------------------------
+
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+    portal: str = Field(default="fellow", pattern="^(fellow|mentor)$")
+
+
+class PasswordResetRequestResponse(BaseModel):
+    message: str
+    recovery_request_id: UUID
+
+
+class PasswordResetVerifyRequest(BaseModel):
+    recovery_request_id: UUID
+    code: str = Field(min_length=8, max_length=8, pattern="^[0-9]{8}$")
+
+
+class PasswordResetVerifyResponse(BaseModel):
+    reset_authorization: str
+
+
+class PasswordResetResendRequest(BaseModel):
+    recovery_request_id: UUID
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    reset_authorization: str = Field(min_length=1)
+    new_password: str = Field(min_length=8, max_length=128)
+    confirm_password: str = Field(min_length=8, max_length=128)
+
+    @model_validator(mode="after")
+    def passwords_must_match(self) -> "PasswordResetConfirmRequest":
+        if self.new_password != self.confirm_password:
+            raise ValueError("Passwords do not match.")
+        return self
+
+
+class PasswordResetConfirmResponse(BaseModel):
+    message: str
