@@ -115,8 +115,8 @@ def require_onboarding_user(
     db: Session = Depends(get_db),
 ) -> User:
     """
-    Allow only Fellows who have set their password but
-    have not yet completed 2FA onboarding.
+    Allow only Fellows, legacy Students, and Mentors who have set their
+    password but have not yet completed 2FA onboarding.
     """
 
     user_id_str = _extract_onboarding_user_id_from_token(
@@ -145,16 +145,17 @@ def require_onboarding_user(
     if user.role not in {
         UserRole.FELLOW,
         UserRole.STUDENT,
+        UserRole.MENTOR,
     }:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Onboarding is restricted to Fellows.",
+            detail="This account role is not eligible for onboarding.",
         )
 
     if user.account_status != AccountStatus.INVITED:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Fellow onboarding has already been completed.",
+            detail="Account onboarding has already been completed.",
         )
 
     if not user.password_set_at:
