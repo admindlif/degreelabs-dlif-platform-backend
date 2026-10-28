@@ -1,0 +1,113 @@
+name: Seed Production Session Overviews
+
+# This workflow changes production data and must only be started manually.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Share the migration lock so production database operations cannot overlap.
+  group: db-migrate
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    name: Seed DISCOVER Session Overviews
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      # Production database (Supabase) — set in GitHub repository secrets.
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      # Required by app Settings validation at import time.
+      SECRET_KEY: ${{ secrets.SECRET_KEY || 'ci-dummy-secret-key-at-least-32-characters-long' }}
+      FRONTEND_BASE_URL: ${{ secrets.FRONTEND_BASE_URL || 'https://fellow.degreelabs.com' }}
+      EMAIL_FROM_ADDRESS: ${{ secrets.EMAIL_FROM_ADDRESS || 'notifications@degreelabs.com' }}
+      EMAIL_FROM_NAME: ${{ secrets.EMAIL_FROM_NAME || 'DegreeLabs DLIF' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify DATABASE_URL is set
+        run: |
+          python - <<'EOF'
+          import os
+          import sys
+
+          if not os.environ.get("DATABASE_URL", "").strip():
+              print("::error::DATABASE_URL secret is not set. Cannot seed session overviews.")
+              sys.exit(1)
+
+          print("DATABASE_URL secret is configured.")
+          EOF
+
+      - name: Report existing DISCOVER overview count
+        run: |
+          python - <<'EOF'
+          from sqlalchemy import func, select
+
+          from app.db.session import SessionLocal
+          from app.models.program_session_overview import ProgramSessionOverview
+
+          with SessionLocal() as db:
+              count = db.scalar(
+                  select(func.count())
+                  .select_from(ProgramSessionOverview)
+                  .where(ProgramSessionOverview.phase_code == "DISCOVER")
+              )
+
+          print(f"Existing DISCOVER overview record count: {count}")
+          EOF
+
+      - name: Seed DISCOVER session overviews
+        run: python scripts/seed_session_overviews.py
+
+      - name: Verify active DISCOVER v1.0 sessions
+        run: |
+          python - <<'EOF'
+          import sys
+
+          from sqlalchemy import select
+
+          from app.db.session import SessionLocal
+          from app.models.program_session_overview import ProgramSessionOverview
+
+          expected_sessions = list(range(1, 13))
+
+          with SessionLocal() as db:
+              actual_sessions = list(
+                  db.scalars(
+                      select(ProgramSessionOverview.session_number)
+                      .where(
+                          ProgramSessionOverview.phase_code == "DISCOVER",
+                          ProgramSessionOverview.source_version == "1.0",
+                          ProgramSessionOverview.is_active.is_(True),
+                          ProgramSessionOverview.session_number.in_(expected_sessions),
+                      )
+                      .order_by(ProgramSessionOverview.session_number)
+                  )
+              )
+
+          if actual_sessions != expected_sessions:
+              missing = sorted(set(expected_sessions) - set(actual_sessions))
+              print(
+                  "::error::Session overview verification failed. "
+                  f"Expected active DISCOVER v1.0 sessions 1-12; missing: {missing}."
+              )
+              sys.exit(1)
+
+          print("Verified 12 active DISCOVER v1.0 session overview records (sessions 1-12).")
+          EOF
