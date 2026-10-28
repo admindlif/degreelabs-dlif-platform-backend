@@ -269,7 +269,7 @@ def test_error_sanitization_removes_sensitive_query_strings():
     assert 'sig=987654321' not in cleaned
     assert 'https://puttanesca.tldv.io/download.mp4' in cleaned
 
-def test_cleanup_preserves_legacy_files(tmp_path):
+def test_cleanup_preserves_legacy_files():
     session_id = uuid4()
     poc_dir = os.path.join(os.getcwd(), 'tmp', 'poc_media')
     os.makedirs(poc_dir, exist_ok=True)

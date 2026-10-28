@@ -199,7 +199,7 @@ def test_activate_account_validation_errors(
         },
     )
     assert resp.status_code == 400
-    assert "Invalid or expired" in resp.json()["detail"]
+    assert "no longer valid" in resp.json()["detail"].lower()
 
 
 def test_activate_account_expired_token(

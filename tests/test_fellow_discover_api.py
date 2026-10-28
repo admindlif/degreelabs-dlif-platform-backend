@@ -195,6 +195,8 @@ def setup_fellow_cohort(db: Session, fellow_user: User):
     
     )
 
+    base_time = datetime.now(timezone.utc) + timedelta(days=1)
+
     # Keep Session access state deterministic for every test run.
     for existing_session in existing_sessions:
         existing_session.is_unlocked = (
@@ -207,14 +209,20 @@ def setup_fellow_cohort(db: Session, fellow_user: User):
             else None
         )
 
+        start_at = (
+            base_time
+            if existing_session.session_number == 0
+            else base_time + timedelta(days=existing_session.session_number)
+        )
+        existing_session.start_at = start_at
+        existing_session.end_at = start_at + timedelta(hours=1)
+
     db.flush()
 
     existing_numbers = {
         session.session_number
         for session in existing_sessions
     }
-
-    base_time = datetime.now(timezone.utc) + timedelta(days=1)
 
     # Session 0 - induction
     if 0 not in existing_numbers:
