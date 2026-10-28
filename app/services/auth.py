@@ -256,7 +256,7 @@ def activate_account(
     user.password_set_at = now
     user.email_verified_at = now
 
-    # Fellow remains INVITED until mandatory 2FA setup is confirmed.
+    # The user remains INVITED until mandatory 2FA setup is confirmed.
     user.account_status = AccountStatus.INVITED
     user.is_active = True
     user.two_factor_enabled = False
@@ -286,7 +286,11 @@ def resume_onboarding(
         or user.password_hash is None
         or not verify_password(password, user.password_hash)
         or not user.is_active
-        or user.role not in {UserRole.FELLOW, UserRole.STUDENT}
+        or user.role not in {
+            UserRole.FELLOW,
+            UserRole.STUDENT,
+            UserRole.MENTOR,
+        }
         or user.account_status != AccountStatus.INVITED
         or user.password_set_at is None
         or user.email_verified_at is None
@@ -379,10 +383,10 @@ def verify_login_credentials(
     Returns:
         (user, challenge_token, access_token)
 
-    Fellows must always complete 2FA before receiving
-    a normal access token.
+    Fellows and Mentors must always complete 2FA before receiving a normal
+    access token.
 
-    Non-Fellow roles may continue without 2FA unless
+    Other roles may continue without 2FA unless
     2FA has explicitly been enabled for their account.
     """
 
@@ -423,11 +427,12 @@ def verify_login_credentials(
         )
 
     # ---------------------------------------------------------
-    # Fellows MUST use 2FA
+    # Fellows and Mentors MUST use 2FA
     # ---------------------------------------------------------
     if user.role in {
         UserRole.FELLOW,
         UserRole.STUDENT,
+        UserRole.MENTOR,
     }:
         if (
             not user.two_factor_enabled
@@ -460,7 +465,7 @@ def verify_login_credentials(
         return user, challenge_token, None
 
     # ---------------------------------------------------------
-    # Non-Fellow account without mandatory 2FA
+    # Account without mandatory 2FA
     # ---------------------------------------------------------
     user.last_login_at = datetime.now(timezone.utc)
 

@@ -16,9 +16,11 @@ from app.core.auth_cookies import (
 from app.core.config import settings
 from app.core.security import create_onboarding_token, hash_password
 from app.models.user import AccountStatus, User, UserRole
+from app.models.user_invitation import UserInvitationToken
 from app.models.user_recovery_code import UserRecoveryCode
 from app.schemas.auth import CreateFellowRequest
 from app.services.auth import admin_create_fellow
+from app.services.invitation import create_invitation_for_user
 
 
 PASSWORD = "Pass12345!"
@@ -33,6 +35,28 @@ def _create_invited_fellow(db: Session, prefix: str) -> tuple[User, str]:
             email=f"{prefix}_{uuid4().hex[:8]}@example.com",
         ),
     )
+
+
+def _create_invited_user(
+    db: Session,
+    prefix: str,
+    role: UserRole,
+) -> tuple[User, str]:
+    user = User(
+        first_name="Test",
+        last_name=role.value.replace("_", " ").title(),
+        email=f"{prefix}_{uuid4().hex[:8]}@example.com",
+        role=role,
+        account_status=AccountStatus.INVITED,
+        is_active=True,
+        two_factor_enabled=False,
+    )
+    db.add(user)
+    db.flush()
+    raw_token = create_invitation_for_user(db, user)
+    db.commit()
+    db.refresh(user)
+    return user, raw_token
 
 
 def _activate(client: TestClient, raw_token: str):
@@ -215,6 +239,242 @@ def test_two_fa_confirmation_activates_and_stores_hashed_recovery_codes(
     finally:
         db.delete(user)
         db.commit()
+
+
+def test_mentor_activation_2fa_and_login_require_second_factor(
+    client: TestClient,
+    db: Session,
+):
+    user, raw_token = _create_invited_user(db, "mentor_onboarding", UserRole.MENTOR)
+
+    try:
+        activation = _activate(client, raw_token)
+        assert activation.status_code == 200
+        db.refresh(user)
+        assert user.account_status == AccountStatus.INVITED
+        assert user.password_set_at is not None
+        assert user.two_factor_enabled is False
+
+        invitation = db.scalar(
+            select(UserInvitationToken).where(UserInvitationToken.user_id == user.id)
+        )
+        assert invitation is not None
+        assert invitation.used_at is not None
+        assert _activate(client, raw_token).status_code == 400
+
+        setup = client.post("/api/v1/auth/2fa/setup")
+        assert setup.status_code == 200
+        assert setup.json()["qr_code_url"] == "/api/v1/auth/2fa/qr"
+        db.refresh(user)
+        assert user.totp_secret is not None
+        assert user.account_status == AccountStatus.INVITED
+
+        qr = client.get("/api/v1/auth/2fa/qr")
+        assert qr.status_code == 200
+        assert qr.headers["content-type"] == "image/png"
+        assert qr.headers["cache-control"] == "no-store"
+
+        correct_code = pyotp.TOTP(user.totp_secret).now()
+        wrong_code = str((int(correct_code) + 1) % 1_000_000).zfill(6)
+        rejected = client.post(
+            "/api/v1/auth/2fa/confirm",
+            json={"code": wrong_code},
+        )
+        assert rejected.status_code == 422
+        db.refresh(user)
+        assert user.account_status == AccountStatus.INVITED
+        assert user.two_factor_enabled is False
+
+        confirmed = client.post(
+            "/api/v1/auth/2fa/confirm",
+            json={"code": correct_code},
+        )
+        assert confirmed.status_code == 200
+        recovery_codes = confirmed.json()["recovery_codes"]
+        assert len(recovery_codes) == 8
+        db.refresh(user)
+        assert user.account_status == AccountStatus.ACTIVE
+        assert user.two_factor_enabled is True
+
+        stored_codes = db.scalars(
+            select(UserRecoveryCode).where(UserRecoveryCode.user_id == user.id)
+        ).all()
+        assert len(stored_codes) == 8
+        assert {item.code_hash for item in stored_codes} == {
+            hashlib.sha256(code.encode()).hexdigest() for code in recovery_codes
+        }
+
+        client.post("/api/v1/auth/logout")
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"email": user.email, "password": PASSWORD},
+        )
+        assert login.status_code == 200
+        assert login.json() == {"requires_2fa": True}
+        assert client.cookies.get(ACCESS_COOKIE_NAME) is None
+        assert client.cookies.get(TWO_FA_CHALLENGE_COOKIE_NAME) is not None
+
+        verified = client.post(
+            "/api/v1/auth/2fa/verify",
+            json={"code": pyotp.TOTP(user.totp_secret).now()},
+        )
+        assert verified.status_code == 200
+        assert client.cookies.get(ACCESS_COOKIE_NAME) is not None
+    finally:
+        db.delete(user)
+        db.commit()
+
+
+def test_mentor_can_resume_onboarding_after_password_setup(
+    client: TestClient,
+    db: Session,
+):
+    user, raw_token = _create_invited_user(db, "mentor_resume", UserRole.MENTOR)
+
+    try:
+        assert _activate(client, raw_token).status_code == 200
+        client.post("/api/v1/auth/logout")
+        assert client.cookies.get(ONBOARDING_COOKIE_NAME) is None
+        assert client.post("/api/v1/auth/2fa/setup").status_code == 401
+
+        invalid = client.post(
+            "/api/v1/auth/onboarding/resume",
+            json={"email": user.email, "password": "wrong-password"},
+        )
+        assert invalid.status_code == 401
+
+        resumed = client.post(
+            "/api/v1/auth/onboarding/resume",
+            json={"email": user.email, "password": PASSWORD},
+        )
+        assert resumed.status_code == 200
+        assert client.cookies.get(ONBOARDING_COOKIE_NAME) is not None
+
+        assert client.post("/api/v1/auth/2fa/setup").status_code == 200
+        db.refresh(user)
+        assert user.totp_secret is not None
+        assert user.account_status == AccountStatus.INVITED
+
+        confirmed = client.post(
+            "/api/v1/auth/2fa/confirm",
+            json={"code": pyotp.TOTP(user.totp_secret).now()},
+        )
+        assert confirmed.status_code == 200
+        db.refresh(user)
+        assert user.account_status == AccountStatus.ACTIVE
+    finally:
+        db.delete(user)
+        db.commit()
+
+
+def test_legacy_student_onboarding_remains_supported(
+    client: TestClient,
+    db: Session,
+):
+    user, raw_token = _create_invited_user(db, "student_onboarding", UserRole.STUDENT)
+
+    try:
+        assert _activate(client, raw_token).status_code == 200
+        assert client.post("/api/v1/auth/2fa/setup").status_code == 200
+        db.refresh(user)
+        assert user.totp_secret is not None
+        assert user.account_status == AccountStatus.INVITED
+
+        confirmed = client.post(
+            "/api/v1/auth/2fa/confirm",
+            json={"code": pyotp.TOTP(user.totp_secret).now()},
+        )
+        assert confirmed.status_code == 200
+        db.refresh(user)
+        assert user.account_status == AccountStatus.ACTIVE
+        assert user.two_factor_enabled is True
+    finally:
+        db.delete(user)
+        db.commit()
+
+
+def test_active_mentor_without_two_fa_cannot_bypass_mandatory_setup(
+    client: TestClient,
+    db: Session,
+):
+    user = User(
+        first_name="Incomplete",
+        last_name="Mentor",
+        email=f"mentor_without_2fa_{uuid4().hex[:8]}@example.com",
+        password_hash=hash_password(PASSWORD),
+        role=UserRole.MENTOR,
+        account_status=AccountStatus.ACTIVE,
+        is_active=True,
+        two_factor_enabled=False,
+        totp_secret=None,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    try:
+        login = client.post(
+            "/api/v1/auth/login",
+            json={"email": user.email, "password": PASSWORD},
+        )
+        assert login.status_code == 403
+        assert login.json()["detail"] == (
+            "Two-factor authentication setup is incomplete."
+        )
+        assert client.cookies.get(ACCESS_COOKIE_NAME) is None
+    finally:
+        db.delete(user)
+        db.commit()
+
+
+def test_admin_and_unapproved_roles_cannot_use_onboarding(
+    client: TestClient,
+    db: Session,
+):
+    for role in (
+        UserRole.ADMIN,
+        UserRole.SUPER_ADMIN,
+        UserRole.PROGRAM_MANAGER,
+    ):
+        now = datetime.now(timezone.utc)
+        user = User(
+            first_name="Blocked",
+            last_name=role.value,
+            email=f"blocked_{role.value}_{uuid4().hex[:8]}@example.com",
+            password_hash=hash_password(PASSWORD),
+            role=role,
+            account_status=AccountStatus.INVITED,
+            is_active=True,
+            two_factor_enabled=False,
+            password_set_at=now,
+            email_verified_at=now,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        try:
+            client.cookies.set(
+                ONBOARDING_COOKIE_NAME,
+                create_onboarding_token(str(user.id)),
+                path="/api/v1/auth",
+            )
+            setup = client.post("/api/v1/auth/2fa/setup")
+            assert setup.status_code == 403
+            assert setup.json()["detail"] == (
+                "This account role is not eligible for onboarding."
+            )
+
+            client.post("/api/v1/auth/logout")
+            resumed = client.post(
+                "/api/v1/auth/onboarding/resume",
+                json={"email": user.email, "password": PASSWORD},
+            )
+            assert resumed.status_code == 401
+        finally:
+            client.post("/api/v1/auth/logout")
+            db.delete(user)
+            db.commit()
 
 
 def test_login_totp_sets_access_cookie_and_me_uses_it(
