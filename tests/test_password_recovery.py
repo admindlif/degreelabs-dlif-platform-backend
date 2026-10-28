@@ -25,9 +25,9 @@ from sqlalchemy.orm import Session
 
 
 
-from app.core.auth_cookies import ACCESS_COOKIE_NAME
+from app.core.auth_cookies import ACCESS_COOKIE_NAME, REFRESH_COOKIE_NAME
 
-from app.core.security import create_access_token, hash_password, verify_password
+from app.core.security import hash_password, verify_password
 
 from app.models.password_recovery import PasswordRecoveryRequest
 
@@ -40,6 +40,7 @@ from app.services.password_recovery import (
     hash_reset_token,
 
 )
+from app.services.auth_session import create_authenticated_session
 
 
 
@@ -411,15 +412,22 @@ def test_confirm_password_reset_and_session_revocation(
 
     db.refresh(fellow_user)
 
-    # Old access token issued 5 minutes ago
+    # Create a server-managed session before the password reset.
 
-    old_access_token = create_access_token(str(fellow_user.id), role=fellow_user.role)
+    server_tokens = create_authenticated_session(db, fellow_user)
+
+    old_access_token = server_tokens.access_token
 
 
 
     # Verify that the old access token works on /me
 
     client.cookies.set(ACCESS_COOKIE_NAME, old_access_token)
+    client.cookies.set(
+        REFRESH_COOKIE_NAME,
+        server_tokens.refresh_token,
+        path="/api/v1/auth",
+    )
 
     res_me = client.get("/api/v1/auth/me")
 
@@ -502,6 +510,10 @@ def test_confirm_password_reset_and_session_revocation(
     res_me_after = client.get("/api/v1/auth/me")
 
     assert res_me_after.status_code == 401
+
+    db.refresh(server_tokens.session)
+
+    assert server_tokens.session.revoked_reason == "password_reset"
 
 
 

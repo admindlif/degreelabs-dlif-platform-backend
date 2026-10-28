@@ -15,6 +15,12 @@ from app.models.checklist import ChecklistItem, FellowChecklistCompletion
 from app.models.progression import TeamPhaseProgression
 from app.models.password_recovery import PasswordRecoveryRequest
 from app.models.phase_gate import PhaseGateAssessment, PhaseGateDimensionResult, DISCOVER_TO_VALIDATE_GATE
+from app.models.auth_session import (
+    AuthAuditEvent,
+    AuthRateLimitBucket,
+    AuthSession,
+    AuthSessionRefreshToken,
+)
 
 __all__ = [
     "User",
@@ -44,4 +50,8 @@ __all__ = [
     "FellowChecklistCompletion",
     "TeamPhaseProgression",
     "PasswordRecoveryRequest",
+    "AuthSession",
+    "AuthSessionRefreshToken",
+    "AuthAuditEvent",
+    "AuthRateLimitBucket",
 ]

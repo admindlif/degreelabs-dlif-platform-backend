@@ -8,6 +8,8 @@ from app.core.config import settings
 ONBOARDING_COOKIE_NAME = "dlif_onboarding"
 TWO_FA_CHALLENGE_COOKIE_NAME = "dlif_2fa_challenge"
 ACCESS_COOKIE_NAME = "dlif_access"
+REFRESH_COOKIE_NAME = "dlif_refresh"
+MFA_ENROLLMENT_COOKIE_NAME = "dlif_mfa_enrollment"
 
 _AUTH_COOKIE_PATH = "/api/v1/auth"
 _ACCESS_COOKIE_PATH = "/api/v1"
@@ -85,6 +87,24 @@ def clear_two_fa_challenge_cookie(response: Response) -> None:
     )
 
 
+def set_mfa_enrollment_cookie(response: Response, token: str) -> None:
+    _set_auth_cookie(
+        response,
+        name=MFA_ENROLLMENT_COOKIE_NAME,
+        value=token,
+        max_age=settings.two_fa_challenge_expire_minutes * 60,
+        path=_AUTH_COOKIE_PATH,
+    )
+
+
+def clear_mfa_enrollment_cookie(response: Response) -> None:
+    _delete_auth_cookie(
+        response,
+        name=MFA_ENROLLMENT_COOKIE_NAME,
+        path=_AUTH_COOKIE_PATH,
+    )
+
+
 def set_access_cookie(response: Response, token: str) -> None:
     _set_auth_cookie(
         response,
@@ -103,7 +123,32 @@ def clear_access_cookie(response: Response) -> None:
     )
 
 
+def set_refresh_cookie(
+    response: Response,
+    token: str,
+    *,
+    max_age: int,
+) -> None:
+    _set_auth_cookie(
+        response,
+        name=REFRESH_COOKIE_NAME,
+        value=token,
+        max_age=max(0, max_age),
+        path=_AUTH_COOKIE_PATH,
+    )
+
+
+def clear_refresh_cookie(response: Response) -> None:
+    _delete_auth_cookie(
+        response,
+        name=REFRESH_COOKIE_NAME,
+        path=_AUTH_COOKIE_PATH,
+    )
+
+
 def clear_all_auth_cookies(response: Response) -> None:
     clear_access_cookie(response)
+    clear_refresh_cookie(response)
     clear_onboarding_cookie(response)
     clear_two_fa_challenge_cookie(response)
+    clear_mfa_enrollment_cookie(response)

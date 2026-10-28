@@ -12,6 +12,7 @@ Covers:
 import hashlib
 import logging
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -19,9 +20,9 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
+from app.core.config import settings
 from app.core.security import (
     create_2fa_challenge_token,
-    create_access_token,
     decode_2fa_challenge_token,
     generate_totp_secret,
     hash_invitation_token,
@@ -95,6 +96,14 @@ class TwoFANotConfiguredError(AuthError):
 
 class InvalidTwoFACodeError(AuthError):
     pass
+
+
+@dataclass(frozen=True)
+class LoginVerificationResult:
+    user: User
+    challenge_token: str | None = None
+    authenticated_without_mfa: bool = False
+    requires_mfa_enrollment: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -376,18 +385,13 @@ def verify_login_credentials(
     db: Session,
     email: str,
     password: str,
-) -> tuple[User, str | None, str | None]:
+) -> LoginVerificationResult:
     """
     Validate email + password.
 
-    Returns:
-        (user, challenge_token, access_token)
-
-    Fellows and Mentors must always complete 2FA before receiving a normal
-    access token.
-
-    Other roles may continue without 2FA unless
-    2FA has explicitly been enabled for their account.
+    Return the verified next step. Access and refresh tokens are issued by the
+    route only after this result, so request metadata can be attached to the
+    server-managed session.
     """
 
     normalized_email = email.strip().lower()
@@ -446,7 +450,10 @@ def verify_login_credentials(
             str(user.id)
         )
 
-        return user, challenge_token, None
+        return LoginVerificationResult(
+            user=user,
+            challenge_token=challenge_token,
+        )
 
     # ---------------------------------------------------------
     # Other roles
@@ -462,21 +469,28 @@ def verify_login_credentials(
             str(user.id)
         )
 
-        return user, challenge_token, None
+        return LoginVerificationResult(
+            user=user,
+            challenge_token=challenge_token,
+        )
+
+    if user.role in {
+        UserRole.ADMIN,
+        UserRole.SUPER_ADMIN,
+        UserRole.PROGRAM_MANAGER,
+    } and settings.privileged_mfa_enforcement_enabled:
+        return LoginVerificationResult(
+            user=user,
+            requires_mfa_enrollment=True,
+        )
 
     # ---------------------------------------------------------
     # Account without mandatory 2FA
     # ---------------------------------------------------------
-    user.last_login_at = datetime.now(timezone.utc)
-
-    db.commit()
-
-    access_token = create_access_token(
-        str(user.id),
-        role=user.role,
+    return LoginVerificationResult(
+        user=user,
+        authenticated_without_mfa=True,
     )
-
-    return user, None, access_token
 
 # ---------------------------------------------------------------------------
 # Login — stage 2: TOTP verification
@@ -487,11 +501,11 @@ def complete_2fa_login(
     db: Session,
     challenge_token: str,
     code: str,
-) -> tuple[User, str]:
+) -> User:
     """
     Verify the TOTP code using a challenge token and issue a full access token.
 
-    Returns ``(user, access_token)``.
+    Returns the authenticated user. The route creates the server session.
 
     Raises ``InvalidTwoFACodeError`` for bad codes.
     """
@@ -559,8 +573,7 @@ def complete_2fa_login(
     user.last_login_at = datetime.now(timezone.utc)
     db.commit()
 
-    access_token = create_access_token(str(user.id), role=user.role)
-    return user, access_token
+    return user
 
 
 # ---------------------------------------------------------------------------

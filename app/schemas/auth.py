@@ -111,6 +111,7 @@ class LoginRequest(BaseModel):
 
 class LoginResponse(BaseModel):
     requires_2fa: bool
+    requires_2fa_setup: bool = False
 
 
 class VerifyTOTPRequest(BaseModel):
@@ -119,6 +120,26 @@ class VerifyTOTPRequest(BaseModel):
 
 class AuthenticationResponse(BaseModel):
     message: str
+
+
+class SessionRefreshResponse(BaseModel):
+    message: str = "Session refreshed successfully."
+
+
+class SessionStatusResponse(BaseModel):
+    authenticated: bool
+    inactivity_expires_at: datetime | None = None
+    absolute_expires_at: datetime | None = None
+    effective_expires_at: datetime | None = None
+    access_expires_at: datetime | None = None
+    server_time: datetime
+
+
+class SessionActivityResponse(BaseModel):
+    inactivity_expires_at: datetime
+    absolute_expires_at: datetime
+    effective_expires_at: datetime
+    server_time: datetime
 
 
 # ---------------------------------------------------------------------------

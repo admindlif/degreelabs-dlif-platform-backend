@@ -4,13 +4,15 @@ DLIF Platform FastAPI application entry point.
 
 import logging
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from app.api.router import api_router
 from app.core.config import settings
 from app.db.session import engine
+from app.core.request_security import request_origin_error
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +51,19 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "Accept", "Range"],
     expose_headers=["Content-Range", "Accept-Ranges", "Content-Length"],
 )
+
+
+@app.middleware("http")
+async def validate_cookie_request_origin(request: Request, call_next):
+    """Reject cross-origin or origin-less unsafe requests carrying auth cookies."""
+    error = request_origin_error(request)
+    if error is not None:
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content={"detail": error},
+            headers={"Cache-Control": "no-store"},
+        )
+    return await call_next(request)
 
 
 @app.middleware("http")

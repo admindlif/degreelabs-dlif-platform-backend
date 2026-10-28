@@ -15,7 +15,34 @@ class Settings(BaseSettings):
 
     # JWT
     secret_key: str = Field(min_length=32)
-    access_token_expire_minutes: int = Field(default=30, gt=0)
+    access_token_expire_minutes: int = Field(default=15, gt=0)
+
+    # Server-managed authenticated sessions
+    session_inactivity_timeout_minutes: int = Field(default=1440, gt=5)
+    session_warning_minutes: int = Field(default=5, gt=0)
+    session_absolute_fellow_hours: int = Field(default=168, gt=0)
+    session_absolute_mentor_hours: int = Field(default=72, gt=0)
+    session_absolute_privileged_hours: int = Field(default=24, gt=0)
+    session_refresh_token_expire_hours: int = Field(default=24, gt=0)
+    session_refresh_token_bytes: int = Field(default=48, ge=32, le=128)
+    session_refresh_race_grace_seconds: int = Field(default=10, ge=1, le=60)
+    session_activity_write_interval_seconds: int = Field(default=300, ge=30, le=3600)
+
+    # Rollout controls. Privileged MFA can be enforced after Stage 2 ships
+    # the enrollment UI. Sessionless access JWTs remain temporarily accepted
+    # so already-issued tokens can expire naturally during deployment.
+    privileged_mfa_enforcement_enabled: bool = False
+    allow_legacy_sessionless_access_tokens: bool = True
+
+    # Authentication failure throttles (shared through PostgreSQL).
+    auth_login_attempt_limit: int = Field(default=5, ge=2, le=100)
+    auth_login_window_minutes: int = Field(default=15, ge=1, le=1440)
+    auth_two_fa_attempt_limit: int = Field(default=5, ge=2, le=100)
+    auth_two_fa_window_minutes: int = Field(default=10, ge=1, le=1440)
+    auth_recovery_attempt_limit: int = Field(default=10, ge=2, le=100)
+    auth_recovery_window_minutes: int = Field(default=15, ge=1, le=1440)
+    auth_refresh_attempt_limit: int = Field(default=30, ge=2, le=500)
+    auth_refresh_window_minutes: int = Field(default=5, ge=1, le=1440)
 
     # Invitation
     invitation_token_expire_hours: int = Field(default=72, gt=0)
@@ -35,6 +62,7 @@ class Settings(BaseSettings):
     # Frontend
     frontend_base_url: str = Field(min_length=1)
     mentor_frontend_base_url: str = Field(default="http://localhost:3003", min_length=1)
+    admin_frontend_base_url: str = Field(default="http://localhost:3002", min_length=1)
     cors_allowed_origins: str | None = None
 
     # Email
@@ -92,7 +120,11 @@ class Settings(BaseSettings):
         if configured:
             candidates = configured.split(",")
         elif self.environment.strip().lower() == "production":
-            candidates = [self.frontend_base_url, self.mentor_frontend_base_url]
+            candidates = [
+                self.frontend_base_url,
+                self.mentor_frontend_base_url,
+                self.admin_frontend_base_url,
+            ]
         else:
             candidates = [
                 self.frontend_base_url,
@@ -136,6 +168,7 @@ class Settings(BaseSettings):
         for label, origin in [
             ("FRONTEND_BASE_URL", self.frontend_base_url),
             ("MENTOR_FRONTEND_BASE_URL", self.mentor_frontend_base_url),
+            ("ADMIN_FRONTEND_BASE_URL", self.admin_frontend_base_url),
             *(("CORS_ALLOWED_ORIGINS", item) for item in self.allowed_origins),
         ]:
             parsed = urlsplit(origin)
@@ -168,6 +201,11 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "AUTH_COOKIE_SAMESITE='none' requires AUTH_COOKIE_SECURE=true."
+            )
+
+        if self.session_warning_minutes >= self.session_inactivity_timeout_minutes:
+            raise ValueError(
+                "SESSION_WARNING_MINUTES must be shorter than the inactivity timeout."
             )
 
         if self.email_backend == "smtp" and not (

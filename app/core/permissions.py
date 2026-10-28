@@ -28,14 +28,29 @@ import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from app.core.auth_cookies import ACCESS_COOKIE_NAME, ONBOARDING_COOKIE_NAME
+from app.core.auth_cookies import (
+    ACCESS_COOKIE_NAME,
+    MFA_ENROLLMENT_COOKIE_NAME,
+    ONBOARDING_COOKIE_NAME,
+)
+from app.core.config import settings
 from app.core.security import (
     decode_access_token,
+    decode_mfa_enrollment_token,
     decode_onboarding_token,
 )
 from app.db.session import get_db
 from app.models.user import AccountStatus, User, UserRole
 from app.repositories.user import get_user_by_id
+from app.models.auth_session import AuthSession
+from app.services.auth_session import (
+    AuthSessionError,
+    RequestMetadata,
+    get_active_session_for_access,
+    hash_client_identifier,
+    sanitize_user_agent,
+    revoke_all_user_sessions,
+)
 
 from uuid import UUID
 from sqlalchemy.orm import Session
@@ -84,6 +99,37 @@ def _extract_user_id_from_token(
     return payload["sub"]
 
 
+def _decode_access_payload(token: str | None) -> dict:
+    if token is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        return decode_access_token(token)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def _request_metadata(request: Request) -> RequestMetadata:
+    client_host = request.client.host if request.client else None
+    return RequestMetadata(
+        ip_address_hash=hash_client_identifier(client_host),
+        user_agent=sanitize_user_agent(request.headers.get("user-agent")),
+    )
+
+
 def _extract_onboarding_user_id_from_token(
     token: str | None,
 ) -> str:
@@ -125,7 +171,7 @@ def require_onboarding_user(
 
     try:
         user_id = UUID(user_id_str)
-    except ValueError:
+    except (TypeError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid onboarding token subject.",
@@ -166,6 +212,50 @@ def require_onboarding_user(
 
     return user
 
+
+def require_2fa_setup_user(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> User:
+    """Allow invited onboarding or controlled privileged MFA enrollment."""
+    if request.cookies.get(ONBOARDING_COOKIE_NAME):
+        return require_onboarding_user(request, db)
+
+    enrollment_token = request.cookies.get(MFA_ENROLLMENT_COOKIE_NAME)
+    if enrollment_token is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Two-factor authentication enrollment is required.",
+        )
+    try:
+        payload = decode_mfa_enrollment_token(enrollment_token)
+        user_id = UUID(payload["sub"])
+    except (jwt.PyJWTError, KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired MFA enrollment session.",
+        ) from exc
+
+    user = get_user_by_id(db, user_id)
+    if (
+        user is None
+        or user.role
+        not in {
+            UserRole.ADMIN,
+            UserRole.SUPER_ADMIN,
+            UserRole.PROGRAM_MANAGER,
+        }
+        or not user.is_active
+        or user.account_status != AccountStatus.ACTIVE
+        or user.password_set_at is None
+        or user.two_factor_enabled
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This account is not eligible for MFA enrollment.",
+        )
+    return user
+
 # ---------------------------------------------------------------------------
 # Base dependency: authenticated user
 # ---------------------------------------------------------------------------
@@ -191,11 +281,12 @@ def require_authenticated_user(
     if token is None and credentials is not None:
         token = credentials.credentials
 
-    user_id_str = _extract_user_id_from_token(token)
+    payload = _decode_access_payload(token)
+    user_id_str = payload.get("sub")
 
     try:
         user_id = UUID(user_id_str)
-    except ValueError:
+    except (TypeError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token subject.",
@@ -210,12 +301,16 @@ def require_authenticated_user(
         )
 
     if not user.is_active:
+        revoke_all_user_sessions(db, user.id, reason="account_inactive")
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is inactive.",
         )
 
     if user.account_status == AccountStatus.SUSPENDED:
+        revoke_all_user_sessions(db, user.id, reason="account_suspended")
+        db.commit()
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account has been suspended.",
@@ -229,7 +324,6 @@ def require_authenticated_user(
 
     if user.password_set_at is not None and token is not None:
         try:
-            payload = decode_access_token(token)
             if "iat" in payload:
                 token_iat_ts = float(payload["iat"])
                 if token_iat_ts < user.password_set_at.timestamp():
@@ -243,7 +337,55 @@ def require_authenticated_user(
         except Exception:
             pass
 
+    session_id_claim = payload.get("sid")
+    if session_id_claim is None:
+        if not settings.allow_legacy_sessionless_access_tokens:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="A server-managed authentication session is required.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        request.state.auth_session = None
+        return user
+
+    try:
+        session_id = UUID(str(session_id_claim))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication session identifier.",
+        ) from exc
+
+    try:
+        auth_session = get_active_session_for_access(
+            db,
+            session_id,
+            user,
+            metadata=_request_metadata(request),
+        )
+    except AuthSessionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=str(exc),
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    request.state.auth_session = auth_session
+
     return user
+
+
+def require_authenticated_session(
+    request: Request,
+    _current_user: User = Depends(require_authenticated_user),
+) -> AuthSession:
+    session = getattr(request.state, "auth_session", None)
+    if not isinstance(session, AuthSession):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="A server-managed authentication session is required.",
+        )
+    return session
 
 
 # ---------------------------------------------------------------------------

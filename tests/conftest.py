@@ -18,6 +18,7 @@ from app.main import app
 from app.models.user import AccountStatus, User, UserRole
 from app.models.user_invitation import UserInvitationToken
 from app.models.user_recovery_code import UserRecoveryCode
+from app.models.auth_session import AuthRateLimitBucket
 
 from app.core.config import settings
 import app.db.session as db_session_module
@@ -115,8 +116,13 @@ def client(db: Session) -> Generator[TestClient, None, None]:
         yield db
 
     app.dependency_overrides[get_db] = _override_get_db
-    with TestClient(app) as test_client:
+    with TestClient(
+        app,
+        headers={"Origin": settings.frontend_base_url.rstrip("/")},
+    ) as test_client:
         yield test_client
+    db.execute(delete(AuthRateLimitBucket))
+    db.commit()
     app.dependency_overrides.clear()
 
 
