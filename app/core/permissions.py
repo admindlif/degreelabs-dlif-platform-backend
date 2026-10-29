@@ -33,6 +33,7 @@ from app.core.auth_cookies import (
     MFA_ENROLLMENT_COOKIE_NAME,
     ONBOARDING_COOKIE_NAME,
 )
+from app.core.client_ip import get_client_ip
 from app.core.config import settings
 from app.core.security import (
     decode_access_token,
@@ -123,7 +124,7 @@ def _decode_access_payload(token: str | None) -> dict:
 
 
 def _request_metadata(request: Request) -> RequestMetadata:
-    client_host = request.client.host if request.client else None
+    client_host = get_client_ip(request)
     return RequestMetadata(
         ip_address_hash=hash_client_identifier(client_host),
         user_agent=sanitize_user_agent(request.headers.get("user-agent")),

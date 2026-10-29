@@ -24,6 +24,7 @@ from app.core.auth_cookies import (
     set_refresh_cookie,
     set_two_fa_challenge_cookie,
 )
+from app.core.client_ip import get_client_ip
 from app.core.permissions import (
     require_2fa_setup_user,
     require_authenticated_session,
@@ -112,7 +113,7 @@ def _prevent_caching(response: Response) -> None:
 
 
 def _request_metadata(request: Request) -> RequestMetadata:
-    client_host = request.client.host if request.client else None
+    client_host = get_client_ip(request)
     return RequestMetadata(
         ip_address_hash=hash_client_identifier(client_host),
         user_agent=sanitize_user_agent(request.headers.get("user-agent")),
@@ -120,7 +121,7 @@ def _request_metadata(request: Request) -> RequestMetadata:
 
 
 def _rate_identifiers(request: Request, subject: str | None = None) -> list[str]:
-    client_host = request.client.host if request.client else "unknown"
+    client_host = get_client_ip(request) or "unknown"
     values = [f"ip:{client_host}"]
     if subject:
         values.append(f"subject:{subject.strip().lower()}")

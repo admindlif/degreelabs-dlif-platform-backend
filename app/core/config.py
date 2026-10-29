@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     auth_refresh_attempt_limit: int = Field(default=30, ge=2, le=500)
     auth_refresh_window_minutes: int = Field(default=5, ge=1, le=1440)
 
+    # Comma-separated proxy CIDRs whose Forwarded/X-Forwarded-For headers may
+    # be trusted. Empty by default so direct clients cannot spoof rate-limit
+    # or audit identities. Configure this only with verified ingress ranges.
+    trusted_proxy_cidrs: str | None = None
+
     # Invitation
     invitation_token_expire_hours: int = Field(default=72, gt=0)
 
