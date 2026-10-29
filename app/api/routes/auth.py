@@ -1,12 +1,15 @@
 """Authentication and Fellow onboarding routes."""
 
 from io import BytesIO
+from uuid import UUID
 
+import jwt
 import qrcode
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.auth_cookies import (
+    ONBOARDING_COOKIE_NAME,
     TWO_FA_CHALLENGE_COOKIE_NAME,
     clear_access_cookie,
     clear_all_auth_cookies,
@@ -23,20 +26,34 @@ from app.core.permissions import (
 from app.core.security import (
     create_access_token,
     create_onboarding_token,
+    decode_2fa_challenge_token,
+    decode_onboarding_token,
     get_totp_uri,
 )
 from app.db.session import get_db
-from app.models.user import User
+from app.models.user import AccountStatus, User, UserRole
+from app.repositories.user import get_user_by_id
 from app.schemas.auth import (
     ActivateAccountRequest,
     ActivateAccountResponse,
     AuthenticationResponse,
     ConfirmTwoFARequest,
     ConfirmTwoFAResponse,
+    EmailOTPResendRequest,
+    EmailOTPSendRequest,
+    EmailOTPSendResponse,
+    EmailOTPVerifyRequest,
     LoginRequest,
     LoginResponse,
     OnboardingResumeRequest,
     OnboardingResumeResponse,
+    PasswordResetConfirmRequest,
+    PasswordResetConfirmResponse,
+    PasswordResetRequest,
+    PasswordResetRequestResponse,
+    PasswordResetResendRequest,
+    PasswordResetVerifyRequest,
+    PasswordResetVerifyResponse,
     TwoFASetupResponse,
     UserResponse,
     VerifyTOTPRequest,
@@ -51,18 +68,116 @@ from app.services.auth import (
     WeakPasswordError,
     activate_account,
     complete_2fa_login,
+    complete_email_otp_activation,
+    complete_email_otp_login,
     confirm_2fa,
     resume_onboarding,
     setup_2fa,
     verify_login_credentials,
 )
-
+from app.services.email_otp import (
+    EmailOTPAttemptLimitError,
+    EmailOTPCooldownError,
+    EmailOTPExpiredError,
+    EmailOTPForbiddenError,
+    EmailOTPRateLimitError,
+    InvalidEmailOTPCodeError,
+    mask_email,
+    send_email_otp,
+)
+from app.services.password_recovery import (
+    InvalidRecoveryCodeError,
+    InvalidResetAuthorizationError,
+    RateLimitError,
+    RecoveryAttemptLimitError,
+    WeakPasswordError as RecoveryWeakPasswordError,
+    confirm_password_reset,
+    request_password_recovery,
+    resend_password_recovery_code,
+    verify_password_recovery_code,
+)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 
 def _prevent_caching(response: Response) -> None:
     response.headers["Cache-Control"] = "no-store"
+
+
+def _resolve_otp_request_user(request: Request, purpose: str, db: Session) -> User:
+    if purpose == "login":
+        challenge_token = request.cookies.get(TWO_FA_CHALLENGE_COOKIE_NAME)
+        if not challenge_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Two-factor authentication challenge session required.",
+            )
+        try:
+            payload = decode_2fa_challenge_token(challenge_token)
+            user_id = UUID(payload["sub"])
+        except (jwt.PyJWTError, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired challenge token.",
+            ) from exc
+
+        user = get_user_by_id(db, user_id)
+        if user is None or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account is invalid or inactive.",
+            )
+        if user.account_status == AccountStatus.SUSPENDED:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This account has been suspended.",
+            )
+        if user.account_status != AccountStatus.ACTIVE:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account setup is incomplete.",
+            )
+        return user
+
+    elif purpose == "activation":
+        onboarding_token = request.cookies.get(ONBOARDING_COOKIE_NAME)
+        if not onboarding_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account activation session required.",
+            )
+        try:
+            payload = decode_onboarding_token(onboarding_token)
+            user_id = UUID(payload["sub"])
+        except (jwt.PyJWTError, KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired onboarding token.",
+            ) from exc
+
+        user = get_user_by_id(db, user_id)
+        if user is None or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account is invalid or inactive.",
+            )
+        if user.account_status == AccountStatus.SUSPENDED:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This account has been suspended.",
+            )
+        if user.account_status != AccountStatus.INVITED:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Account is already activated.",
+            )
+        return user
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid purpose specified.",
+        )
 
 
 @router.post(
@@ -176,7 +291,10 @@ def two_fa_qr(
     )
     image = qrcode.make(provisioning_uri)
     output = BytesIO()
-    image.save(output, format="PNG")
+    # Pass the format positionally because qrcode's runtime accepts
+    # ``format=`` but its published type information does not expose that
+    # keyword consistently to static analyzers such as Pyrefly.
+    image.save(output, "PNG")
 
     return Response(
         content=output.getvalue(),
@@ -238,7 +356,14 @@ def login(
 ) -> LoginResponse:
     """Validate credentials and establish the next session cookie."""
     try:
-        _user, challenge_token, access_token = verify_login_credentials(
+        (
+            _user,
+            challenge_token,
+            access_token,
+            available_methods,
+            default_method,
+            masked_email,
+        ) = verify_login_credentials(
             db,
             str(data.email),
             data.password,
@@ -270,14 +395,24 @@ def login(
     if access_token is not None:
         set_access_cookie(response, access_token)
         clear_two_fa_challenge_cookie(response)
-        return LoginResponse(requires_2fa=False)
+        return LoginResponse(
+            requires_2fa=False,
+            available_methods=[],
+            default_method=None,
+            masked_email=None,
+        )
 
     if challenge_token is None:
         raise RuntimeError("Authentication service did not issue a session token.")
 
     clear_access_cookie(response)
     set_two_fa_challenge_cookie(response, challenge_token)
-    return LoginResponse(requires_2fa=True)
+    return LoginResponse(
+        requires_2fa=True,
+        available_methods=available_methods,
+        default_method=default_method,
+        masked_email=masked_email,
+    )
 
 
 @router.post(
@@ -332,6 +467,189 @@ def two_fa_verify(
     return AuthenticationResponse(message="Authentication successful.")
 
 
+# ---------------------------------------------------------------------------
+# Email OTP Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/email-otp/send",
+    response_model=EmailOTPSendResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Send a 6-digit verification code to the user's email",
+)
+def email_otp_send(
+    data: EmailOTPSendRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> EmailOTPSendResponse:
+    _prevent_caching(response)
+    user = _resolve_otp_request_user(request, data.purpose, db)
+
+    try:
+        challenge, _code = send_email_otp(
+            db,
+            user,
+            purpose=data.purpose,
+            ip_address=request.client.host if request.client else None,
+        )
+    except EmailOTPForbiddenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+        ) from exc
+    except EmailOTPCooldownError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+        ) from exc
+    except EmailOTPRateLimitError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to deliver verification code. Please try again later.",
+        ) from exc
+
+    return EmailOTPSendResponse(
+        message="Verification code sent to your email address.",
+        masked_email=mask_email(user.email),
+        expires_in_seconds=300,
+        resend_cooldown_seconds=60,
+    )
+
+
+@router.post(
+    "/email-otp/resend",
+    response_model=EmailOTPSendResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Resend a 6-digit verification code subject to cooldown",
+)
+def email_otp_resend(
+    data: EmailOTPResendRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> EmailOTPSendResponse:
+    send_req = EmailOTPSendRequest(purpose=data.purpose)
+    return email_otp_send(send_req, request, response, db)
+
+
+@router.post(
+    "/email-otp/verify",
+    response_model=AuthenticationResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Verify 6-digit Email OTP for login or account activation",
+)
+def email_otp_verify(
+    data: EmailOTPVerifyRequest,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+) -> AuthenticationResponse:
+    _prevent_caching(response)
+
+    if data.purpose == "login":
+        challenge_token = request.cookies.get(TWO_FA_CHALLENGE_COOKIE_NAME)
+        if challenge_token is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Two-factor authentication challenge session required.",
+            )
+
+        try:
+            _user, access_token = complete_email_otp_login(
+                db,
+                challenge_token,
+                data.code,
+            )
+        except InvalidCredentialsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc),
+            ) from exc
+        except (InvalidEmailOTPCodeError, EmailOTPExpiredError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc),
+            ) from exc
+        except EmailOTPAttemptLimitError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=str(exc),
+            ) from exc
+        except EmailOTPForbiddenError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from exc
+        except AccountSuspendedError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from exc
+
+        set_access_cookie(response, access_token)
+        clear_two_fa_challenge_cookie(response)
+        clear_onboarding_cookie(response)
+        return AuthenticationResponse(message="Authentication successful.")
+
+    elif data.purpose == "activation":
+        onboarding_token = request.cookies.get(ONBOARDING_COOKIE_NAME)
+        if onboarding_token is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Account activation session required.",
+            )
+
+        try:
+            _user, access_token = complete_email_otp_activation(
+                db,
+                onboarding_token,
+                data.code,
+            )
+        except InvalidCredentialsError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc),
+            ) from exc
+        except (InvalidEmailOTPCodeError, EmailOTPExpiredError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=str(exc),
+            ) from exc
+        except EmailOTPAttemptLimitError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=str(exc),
+            ) from exc
+        except EmailOTPForbiddenError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from exc
+        except AccountSuspendedError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=str(exc),
+            ) from exc
+
+        set_access_cookie(response, access_token)
+        clear_onboarding_cookie(response)
+        clear_two_fa_challenge_cookie(response)
+        return AuthenticationResponse(message="Account successfully activated.")
+
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid purpose.",
+        )
+
+
 @router.post(
     "/logout",
     response_model=AuthenticationResponse,
@@ -362,27 +680,6 @@ def me(
 # ---------------------------------------------------------------------------
 # Password Reset / Self-Service Recovery Routes
 # ---------------------------------------------------------------------------
-
-from app.schemas.auth import (
-    PasswordResetConfirmRequest,
-    PasswordResetConfirmResponse,
-    PasswordResetRequest,
-    PasswordResetRequestResponse,
-    PasswordResetResendRequest,
-    PasswordResetVerifyRequest,
-    PasswordResetVerifyResponse,
-)
-from app.services.password_recovery import (
-    InvalidRecoveryCodeError,
-    InvalidResetAuthorizationError,
-    RateLimitError,
-    RecoveryAttemptLimitError,
-    WeakPasswordError as RecoveryWeakPasswordError,
-    confirm_password_reset,
-    request_password_recovery,
-    resend_password_recovery_code,
-    verify_password_recovery_code,
-)
 
 
 @router.post(
