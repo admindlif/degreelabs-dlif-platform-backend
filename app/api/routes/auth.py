@@ -291,7 +291,10 @@ def two_fa_qr(
     )
     image = qrcode.make(provisioning_uri)
     output = BytesIO()
-    image.save(output, format="PNG")
+    # Pass the format positionally because qrcode's runtime accepts
+    # ``format=`` but its published type information does not expose that
+    # keyword consistently to static analyzers such as Pyrefly.
+    image.save(output, "PNG")
 
     return Response(
         content=output.getvalue(),
