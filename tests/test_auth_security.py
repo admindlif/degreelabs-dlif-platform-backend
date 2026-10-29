@@ -310,7 +310,7 @@ def test_mentor_activation_2fa_and_login_require_second_factor(
             json={"email": user.email, "password": PASSWORD},
         )
         assert login.status_code == 200
-        assert login.json() == {"requires_2fa": True}
+        assert login.json()["requires_2fa"] is True
         assert client.cookies.get(ACCESS_COOKIE_NAME) is None
         assert client.cookies.get(TWO_FA_CHALLENGE_COOKIE_NAME) is not None
 
@@ -493,7 +493,7 @@ def test_login_totp_sets_access_cookie_and_me_uses_it(
             json={"email": user.email, "password": PASSWORD},
         )
         assert login.status_code == 200
-        assert login.json() == {"requires_2fa": True}
+        assert login.json()["requires_2fa"] is True
         assert "challenge_token" not in login.json()
         assert client.cookies.get(TWO_FA_CHALLENGE_COOKIE_NAME) is not None
 
@@ -555,7 +555,7 @@ def test_login_without_two_fa_sets_access_cookie_without_returning_token(
             json={"email": user.email, "password": PASSWORD},
         )
         assert login.status_code == 200
-        assert login.json() == {"requires_2fa": False}
+        assert login.json()["requires_2fa"] is False
         assert "access_token" not in login.json()
         assert client.cookies.get(ACCESS_COOKIE_NAME) is not None
         assert client.cookies.get(TWO_FA_CHALLENGE_COOKIE_NAME) is None

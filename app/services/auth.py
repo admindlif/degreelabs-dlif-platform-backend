@@ -5,7 +5,7 @@ Covers:
 - Admin creating a student (invitation-based onboarding)
 - Account activation (token → password)
 - 2FA setup and confirmation
-- Two-stage login (password → challenge token → TOTP → session)
+- Two-stage login (password → challenge token → TOTP / Email OTP → session)
 - Current user retrieval
 """
 
@@ -23,6 +23,7 @@ from app.core.security import (
     create_2fa_challenge_token,
     create_access_token,
     decode_2fa_challenge_token,
+    decode_onboarding_token,
     generate_totp_secret,
     hash_invitation_token,
     hash_password,
@@ -49,6 +50,10 @@ from app.schemas.auth import (
     ActivateAccountRequest,
     CreateFellowRequest,
     CreateStudentRequest,
+)
+from app.services.email_otp import (
+    mask_email,
+    verify_email_otp,
 )
 from app.services.invitation import create_invitation_for_user
 
@@ -174,7 +179,6 @@ def activate_account(
     7. account_status remains ``invited`` until 2FA is confirmed.
     8. Commit the transaction.
     """
-    # DIAGNOSTIC — temporary, remove once root cause of early expiry is confirmed.
     logger.info("[ACTIVATE] activation attempt received")
 
     if data.password != data.confirm_password:
@@ -200,7 +204,7 @@ def activate_account(
             "If you received more than one invitation email, "
             "please use the most recent one."
         )
-    # Log safe timing metadata for diagnosis (no raw token, no hash, no email).
+
     logger.info(
         "[ACTIVATE] invitation_found=True created_at=%s expires_at=%s "
         "used_at=%s server_utc=%s",
@@ -209,7 +213,7 @@ def activate_account(
         invitation.used_at.isoformat() if invitation.used_at else "None",
         now.isoformat(),
     )
-    
+
     if invitation.used_at is not None:
         logger.warning(
             "[ACTIVATE] failure=TOKEN_ALREADY_USED used_at=%s server_utc=%s",
@@ -239,9 +243,7 @@ def activate_account(
             "[ACTIVATE] failure=ACCOUNT_STATE_INVALID reason=user_not_found server_utc=%s",
             now.isoformat(),
         )
-        raise InvalidInvitationError(
-            "User not found."
-        )
+        raise InvalidInvitationError("User not found.")
 
     if user.account_status != AccountStatus.INVITED:
         logger.warning(
@@ -252,6 +254,7 @@ def activate_account(
         raise AccountNotInvitedError(
             "This account has already been activated or is suspended."
         )
+
     user.password_hash = hash_password(data.password)
     user.password_set_at = now
     user.email_verified_at = now
@@ -263,14 +266,12 @@ def activate_account(
     user.totp_secret = None
 
     mark_invitation_used(db, invitation)
-    
 
     db.commit()
     db.refresh(user)
 
     logger.info("[ACTIVATE] success user_id=%s", str(user.id))
     return user
-
 
 
 def resume_onboarding(
@@ -296,9 +297,6 @@ def resume_onboarding(
         or user.email_verified_at is None
         or user.two_factor_enabled
     ):
-        # One response covers unknown email, wrong password, completed onboarding,
-        # suspended accounts, and invalid state so this endpoint is not an
-        # account-enumeration oracle.
         raise InvalidCredentialsError(
             "Unable to resume onboarding with the supplied credentials."
         )
@@ -360,6 +358,7 @@ def confirm_2fa(
 
     user.two_factor_enabled = True
     user.account_status = AccountStatus.ACTIVE
+    user.preferred_auth_method = "authenticator"
 
     db.commit()
     db.refresh(user)
@@ -376,12 +375,12 @@ def verify_login_credentials(
     db: Session,
     email: str,
     password: str,
-) -> tuple[User, str | None, str | None]:
+) -> tuple[User, str | None, str | None, list[str], str | None, str | None]:
     """
     Validate email + password.
 
     Returns:
-        (user, challenge_token, access_token)
+        (user, challenge_token, access_token, available_methods, default_method, masked_email)
 
     Fellows and Mentors must always complete 2FA before receiving a normal
     access token.
@@ -427,30 +426,47 @@ def verify_login_credentials(
         )
 
     # ---------------------------------------------------------
-    # Fellows and Mentors MUST use 2FA
+    # Fellows and Mentors: mandatory 2FA required
     # ---------------------------------------------------------
     if user.role in {
         UserRole.FELLOW,
         UserRole.STUDENT,
         UserRole.MENTOR,
     }:
-        if (
-            not user.two_factor_enabled
-            or not user.totp_secret
-        ):
+        if not user.two_factor_enabled:
             raise TwoFANotConfiguredError(
                 "Two-factor authentication setup is incomplete."
             )
 
-        challenge_token = create_2fa_challenge_token(
-            str(user.id)
-        )
+        available_methods: list[str] = []
+        if user.totp_secret:
+            available_methods.append("authenticator")
+        if user.email:
+            available_methods.append("email_otp")
 
-        return user, challenge_token, None
+        if not available_methods:
+            raise TwoFANotConfiguredError(
+                "Two-factor authentication setup is incomplete."
+            )
+
+        default_method = None
+        if user.preferred_auth_method in available_methods:
+            default_method = user.preferred_auth_method
+        elif "email_otp" in available_methods and not user.totp_secret:
+            default_method = "email_otp"
+        elif "authenticator" in available_methods:
+            default_method = "authenticator"
+        elif available_methods:
+            default_method = available_methods[0]
+
+        masked_email = mask_email(user.email) if "email_otp" in available_methods else None
+
+        challenge_token = create_2fa_challenge_token(str(user.id))
+        return user, challenge_token, None, available_methods, default_method, masked_email
 
     # ---------------------------------------------------------
-    # Other roles
-    # If they have 2FA enabled, require it.
+    # Other roles (including Admin, Super Admin, Program Manager)
+    # If they have 2FA enabled, require Authenticator (never Email OTP)
     # ---------------------------------------------------------
     if user.two_factor_enabled:
         if not user.totp_secret:
@@ -458,11 +474,8 @@ def verify_login_credentials(
                 "Two-factor authentication configuration is incomplete."
             )
 
-        challenge_token = create_2fa_challenge_token(
-            str(user.id)
-        )
-
-        return user, challenge_token, None
+        challenge_token = create_2fa_challenge_token(str(user.id))
+        return user, challenge_token, None, ["authenticator"], "authenticator", None
 
     # ---------------------------------------------------------
     # Account without mandatory 2FA
@@ -476,7 +489,8 @@ def verify_login_credentials(
         role=user.role,
     )
 
-    return user, None, access_token
+    return user, None, access_token, [], None, None
+
 
 # ---------------------------------------------------------------------------
 # Login — stage 2: TOTP verification
@@ -502,32 +516,23 @@ def complete_2fa_login(
         user_id = UUID(payload["sub"])
     except (jwt.PyJWTError, KeyError, TypeError, ValueError) as exc:
         raise InvalidCredentialsError("Invalid or expired challenge token.") from exc
-    user = get_user_by_id(db, user_id)
 
-    
+    user = get_user_by_id(db, user_id)
 
     if user is None:
         raise InvalidCredentialsError("User not found.")
 
     if not user.is_active:
-        raise InvalidCredentialsError(
-            "Account is inactive."
-        )
+        raise InvalidCredentialsError("Account is inactive.")
 
     if user.account_status == AccountStatus.SUSPENDED:
-        raise AccountSuspendedError(
-            "This account has been suspended."
-        )
+        raise AccountSuspendedError("This account has been suspended.")
 
     if user.account_status != AccountStatus.ACTIVE:
-        raise InvalidCredentialsError(
-            "Account setup is incomplete."
-        )
+        raise InvalidCredentialsError("Account setup is incomplete.")
 
     if not user.two_factor_enabled:
-        raise TwoFANotConfiguredError(
-            "Two-factor authentication is not enabled."
-        )
+        raise TwoFANotConfiguredError("Two-factor authentication is not enabled.")
 
     # Allow recovery code or dev verification code as alternative to TOTP
     if not (
@@ -546,9 +551,7 @@ def complete_2fa_login(
         )
 
         if recovery is None:
-            raise InvalidTwoFACodeError(
-                "Invalid authentication code."
-            )
+            raise InvalidTwoFACodeError("Invalid authentication code.")
 
         # Recovery codes are strictly one-time use.
         recovery.used = True
@@ -558,6 +561,93 @@ def complete_2fa_login(
     # Update last login
     user.last_login_at = datetime.now(timezone.utc)
     db.commit()
+
+    access_token = create_access_token(str(user.id), role=user.role)
+    return user, access_token
+
+
+# ---------------------------------------------------------------------------
+# Email OTP Completion (Login & Activation)
+# ---------------------------------------------------------------------------
+
+
+def complete_email_otp_login(
+    db: Session,
+    challenge_token: str,
+    code: str,
+) -> tuple[User, str]:
+    """Verify Email OTP using challenge token and issue access token."""
+    import jwt
+
+    try:
+        payload = decode_2fa_challenge_token(challenge_token)
+        user_id = UUID(payload["sub"])
+    except (jwt.PyJWTError, KeyError, TypeError, ValueError) as exc:
+        raise InvalidCredentialsError("Invalid or expired challenge token.") from exc
+
+    user = get_user_by_id(db, user_id)
+    if user is None:
+        raise InvalidCredentialsError("User not found.")
+
+    if not user.is_active:
+        raise InvalidCredentialsError("Account is inactive.")
+
+    if user.account_status == AccountStatus.SUSPENDED:
+        raise AccountSuspendedError("This account has been suspended.")
+
+    if user.account_status != AccountStatus.ACTIVE:
+        raise InvalidCredentialsError("Account setup is incomplete.")
+
+    verify_email_otp(db, user, purpose="login", code=code)
+
+    if user.preferred_auth_method is None:
+        user.preferred_auth_method = "email_otp"
+
+    user.last_login_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(user)
+
+    access_token = create_access_token(str(user.id), role=user.role)
+    return user, access_token
+
+
+def complete_email_otp_activation(
+    db: Session,
+    onboarding_token: str,
+    code: str,
+) -> tuple[User, str]:
+    """Verify Email OTP using onboarding token and activate account."""
+    import jwt
+
+    try:
+        payload = decode_onboarding_token(onboarding_token)
+        user_id = UUID(payload["sub"])
+    except (jwt.PyJWTError, KeyError, TypeError, ValueError) as exc:
+        raise InvalidCredentialsError("Invalid or expired onboarding token.") from exc
+
+    user = get_user_by_id(db, user_id)
+    if user is None:
+        raise InvalidCredentialsError("User not found.")
+
+    if not user.is_active:
+        raise InvalidCredentialsError("Account is inactive.")
+
+    if user.account_status == AccountStatus.SUSPENDED:
+        raise AccountSuspendedError("This account has been suspended.")
+
+    if user.account_status != AccountStatus.INVITED:
+        raise InvalidCredentialsError("Account is already active or in an invalid state.")
+
+    verify_email_otp(db, user, purpose="activation", code=code)
+
+    now = datetime.now(timezone.utc)
+    user.account_status = AccountStatus.ACTIVE
+    user.two_factor_enabled = True
+    user.email_verified_at = now
+    user.preferred_auth_method = "email_otp"
+    user.last_login_at = now
+    db.commit()
+    db.refresh(user)
 
     access_token = create_access_token(str(user.id), role=user.role)
     return user, access_token
