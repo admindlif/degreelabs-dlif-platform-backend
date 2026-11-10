@@ -6,6 +6,7 @@ API contract decoupled from the database layer.
 """
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, model_validator
@@ -112,6 +113,9 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     requires_2fa: bool
     requires_2fa_setup: bool = False
+    available_methods: list[str] = ["authenticator"]
+    default_method: str | None = None
+    masked_email: str | None = None
 
 
 class VerifyTOTPRequest(BaseModel):
@@ -120,6 +124,31 @@ class VerifyTOTPRequest(BaseModel):
 
 class AuthenticationResponse(BaseModel):
     message: str
+
+
+# ---------------------------------------------------------------------------
+# Email OTP Authentication
+# ---------------------------------------------------------------------------
+
+
+class EmailOTPSendRequest(BaseModel):
+    purpose: Literal["login", "activation"] = "login"
+
+
+class EmailOTPSendResponse(BaseModel):
+    message: str
+    masked_email: str
+    expires_in_seconds: int = 300
+    resend_cooldown_seconds: int = 60
+
+
+class EmailOTPVerifyRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern="^[0-9]{6}$")
+    purpose: Literal["login", "activation"] = "login"
+
+
+class EmailOTPResendRequest(BaseModel):
+    purpose: Literal["login", "activation"] = "login"
 
 
 class SessionRefreshResponse(BaseModel):
@@ -156,6 +185,7 @@ class UserResponse(BaseModel):
     account_status: AccountStatus
     is_active: bool
     two_factor_enabled: bool
+    preferred_auth_method: str | None = None
     email_verified_at: datetime | None
     last_login_at: datetime | None
     created_at: datetime

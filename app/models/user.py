@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from app.models.user_invitation import UserInvitationToken
     from app.models.user_recovery_code import UserRecoveryCode
     from app.models.password_recovery import PasswordRecoveryRequest
+    from app.models.email_otp import EmailOTPChallenge
 class UserRole(str, Enum):
     SUPER_ADMIN = "super_admin"
     ADMIN = "admin"
@@ -112,6 +113,11 @@ class User(Base):
         nullable=True,
     )
 
+    preferred_auth_method: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+    )
+
     password_set_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
@@ -156,6 +162,12 @@ class User(Base):
 
     auth_sessions: Mapped[list["AuthSession"]] = relationship(  # noqa: F821
         "AuthSession",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+
+    email_otp_challenges: Mapped[list["EmailOTPChallenge"]] = relationship(  # noqa: F821
+        "EmailOTPChallenge",
         back_populates="user",
         cascade="all, delete-orphan",
     )

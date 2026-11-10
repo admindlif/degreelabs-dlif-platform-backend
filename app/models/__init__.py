@@ -14,6 +14,7 @@ from app.models.feedback import SubmissionFeedback
 from app.models.checklist import ChecklistItem, FellowChecklistCompletion
 from app.models.progression import TeamPhaseProgression
 from app.models.password_recovery import PasswordRecoveryRequest
+from app.models.email_otp import EmailOTPChallenge
 from app.models.phase_gate import PhaseGateAssessment, PhaseGateDimensionResult, DISCOVER_TO_VALIDATE_GATE
 from app.models.auth_session import (
     AuthAuditEvent,
@@ -50,6 +51,7 @@ __all__ = [
     "FellowChecklistCompletion",
     "TeamPhaseProgression",
     "PasswordRecoveryRequest",
+    "EmailOTPChallenge",
     "AuthSession",
     "AuthSessionRefreshToken",
     "AuthAuditEvent",
