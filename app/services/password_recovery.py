@@ -37,6 +37,7 @@ from app.repositories.password_recovery import (
     get_recovery_request_by_reset_token_hash,
     invalidate_active_requests_for_user,
 )
+from app.services.auth_session import revoke_all_user_sessions
 from app.repositories.user import get_user_by_email
 from app.services.email import send_email
 
@@ -526,6 +527,15 @@ def confirm_password_reset(
         user.email_verified_at = now
 
     request.consumed_at = now
+
+    # Revoke every server-managed browser session in the same transaction as
+    # the password change. Legacy JWTs remain covered by password_set_at.
+    revoke_all_user_sessions(
+        db,
+        user.id,
+        reason="password_reset",
+        now=now,
+    )
 
     # Invalidate all remaining recovery requests for this user
     invalidate_active_requests_for_user(db, user.id)

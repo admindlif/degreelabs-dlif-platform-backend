@@ -112,7 +112,8 @@ class LoginRequest(BaseModel):
 
 class LoginResponse(BaseModel):
     requires_2fa: bool
-    available_methods: list[str] = ["authenticator"]
+    requires_2fa_setup: bool = False
+    available_methods: list[str] | None = None
     default_method: str | None = None
     masked_email: str | None = None
 
@@ -148,6 +149,26 @@ class EmailOTPVerifyRequest(BaseModel):
 
 class EmailOTPResendRequest(BaseModel):
     purpose: Literal["login", "activation"] = "login"
+
+
+class SessionRefreshResponse(BaseModel):
+    message: str = "Session refreshed successfully."
+
+
+class SessionStatusResponse(BaseModel):
+    authenticated: bool
+    inactivity_expires_at: datetime | None = None
+    absolute_expires_at: datetime | None = None
+    effective_expires_at: datetime | None = None
+    access_expires_at: datetime | None = None
+    server_time: datetime
+
+
+class SessionActivityResponse(BaseModel):
+    inactivity_expires_at: datetime
+    absolute_expires_at: datetime
+    effective_expires_at: datetime
+    server_time: datetime
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+from uuid import UUID
 
 import jwt
 import pyotp
@@ -32,6 +33,7 @@ ALGORITHM = "HS256"
 _TOKEN_TYPE_ACCESS = "access"
 _TOKEN_TYPE_ONBOARDING = "onboarding"
 _TOKEN_TYPE_2FA_CHALLENGE = "2fa_challenge"
+_TOKEN_TYPE_MFA_ENROLLMENT = "mfa_enrollment"
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +62,9 @@ def verify_password(
 def create_access_token(
     subject: str,
     role: UserRole | str | None = None,
+    *,
+    session_id: str | UUID | None = None,
+    now: datetime | None = None,
 ) -> str:
     """
     Create a signed JWT access token for the given user ID.
@@ -68,18 +73,21 @@ def create_access_token(
     ``role`` is optionally embedded as a claim so portal APIs can gate access
     without a database lookup on every request.
     """
-    expires_at = datetime.now(timezone.utc) + timedelta(
+    issued_at = now or datetime.now(timezone.utc)
+    expires_at = issued_at + timedelta(
         minutes=settings.access_token_expire_minutes
     )
 
     payload: dict = {
         "sub": subject,
         "exp": expires_at,
-        "iat": datetime.now(timezone.utc).timestamp(),
+        "iat": issued_at.timestamp(),
         "type": _TOKEN_TYPE_ACCESS,
     }
     if role is not None:
         payload["role"] = role.value if isinstance(role, UserRole) else str(role)
+    if session_id is not None:
+        payload["sid"] = str(session_id)
 
     return jwt.encode(
         payload,
@@ -88,7 +96,11 @@ def create_access_token(
     )
 
 
-def decode_access_token(token: str) -> dict:
+def decode_access_token(
+    token: str,
+    *,
+    verify_expiration: bool = True,
+) -> dict:
     """
     Decode and validate a JWT access token.
 
@@ -98,6 +110,7 @@ def decode_access_token(token: str) -> dict:
         token,
         settings.secret_key,
         algorithms=[ALGORITHM],
+        options={"verify_exp": verify_expiration},
     )
 
     if payload.get("type") != _TOKEN_TYPE_ACCESS:
@@ -195,6 +208,38 @@ def decode_2fa_challenge_token(token: str) -> dict:
     if payload.get("type") != _TOKEN_TYPE_2FA_CHALLENGE:
         raise jwt.InvalidTokenError("Token type mismatch")
 
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# JWT — privileged-role MFA enrollment
+# ---------------------------------------------------------------------------
+
+
+def create_mfa_enrollment_token(user_id: str) -> str:
+    """Create a short-lived password-verified MFA enrollment token."""
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        minutes=settings.two_fa_challenge_expire_minutes
+    )
+    return jwt.encode(
+        {
+            "sub": user_id,
+            "exp": expires_at,
+            "type": _TOKEN_TYPE_MFA_ENROLLMENT,
+        },
+        settings.secret_key,
+        algorithm=ALGORITHM,
+    )
+
+
+def decode_mfa_enrollment_token(token: str) -> dict:
+    payload = jwt.decode(
+        token,
+        settings.secret_key,
+        algorithms=[ALGORITHM],
+    )
+    if payload.get("type") != _TOKEN_TYPE_MFA_ENROLLMENT:
+        raise jwt.InvalidTokenError("Token type mismatch")
     return payload
 
 

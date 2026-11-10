@@ -2835,6 +2835,15 @@ def update_mentor(
         except ValueError:
             raise HTTPException(status_code=422, detail=f"Invalid account status '{status_str}'.")
 
+        if mentor.account_status == AccountStatus.SUSPENDED:
+            from app.services.auth_session import revoke_all_user_sessions
+
+            revoke_all_user_sessions(
+                db,
+                mentor.id,
+                reason="account_suspended",
+            )
+
     db.commit()
     db.refresh(mentor)
     return {

@@ -34,6 +34,12 @@ from app.services.tldv import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_r2_playback_lookup(monkeypatch):
+    """Keep media API tests isolated from configured external R2 storage."""
+    monkeypatch.setattr("app.services.tldv.object_exists", lambda _key: False)
+
+
 @pytest.fixture
 def test_setup(db: Session):
     """
