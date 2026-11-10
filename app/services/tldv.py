@@ -9,6 +9,7 @@ Provides:
 """
 
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 import os
 import re
@@ -616,13 +617,72 @@ def _get_session_lock(session_id: str) -> threading.RLock:
 
 
 get_session_lock = _get_session_lock
+
+
+def _build_mobile_compatible_remux_command(
+    input_path: str,
+    output_path: str,
+) -> list[str]:
+    """Build an MP4 that keeps the video but normalizes audio for mobile decoders."""
+    return [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-profile:a", "aac_low",
+        "-ar", "48000",
+        "-ac", "2",
+        "-b:a", "160k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+
+def _has_mobile_compatible_aac(filepath: str) -> bool:
+    """Return whether an MP4 declares a usable AAC-LC decoder configuration."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name,profile,extradata_size",
+                "-of", "json",
+                filepath,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return False
+
+        streams = json.loads(result.stdout).get("streams", [])
+        if len(streams) != 1:
+            return False
+
+        audio = streams[0]
+        profile = str(audio.get("profile", "")).strip().lower()
+        extradata_size = int(audio.get("extradata_size") or 0)
+        return (
+            audio.get("codec_name") == "aac"
+            and profile in {"lc", "aac lc", "low complexity"}
+            and extradata_size > 0
+        )
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
 def _ensure_seekable_recording_file(session: DBSession) -> str:
     """
     Locate or dynamically prepare a seekable MP4 file for any session.
     1. Checks session-specific candidate paths in tmp/poc_media.
     2. If valid seekable file exists, returns immediately (no redundant downloads).
     3. If missing, downloads the raw stream from tl;dv using client.get_recording_playback.
-    4. Remuxes using FFmpeg stream copy (-c copy -movflags +faststart) for proper byte-range seeking.
+    4. Copies video and encodes audio as AAC-LC for mobile-compatible playback.
     5. Caches output as session_{session.id}_seekable.mp4 and removes intermediate raw file.
     """
     poc_dir = os.path.join(os.getcwd(), "tmp", "poc_media")
@@ -818,15 +878,13 @@ def _ensure_seekable_recording_file(session: DBSession) -> str:
                 detail="Failed to download complete recording file from provider.",
             )
 
-        # 2. Remux complete raw file into seekable MP4 with FFmpeg (+faststart)
-        cmd_remux = [
-            "ffmpeg",
-            "-y",
-            "-i", raw_path,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            canonical_seekable_path,
-        ]
+        # 2. Preserve video quality while normalizing audio to AAC-LC. Some provider
+        # MP4s omit AAC AudioSpecificConfig metadata; tolerant desktop decoders can
+        # infer it, but mobile decoders may present the track as silent.
+        cmd_remux = _build_mobile_compatible_remux_command(
+            raw_path,
+            tmp_seekable_path,
+        )
         try:
             res_remux = subprocess.run(cmd_remux, capture_output=True, text=True)
             if res_remux.returncode != 0:
@@ -835,16 +893,37 @@ def _ensure_seekable_recording_file(session: DBSession) -> str:
                     session.id,
                     _sanitize_media_log(res_remux.stderr),
                 )
-                if os.path.exists(canonical_seekable_path):
+                if os.path.exists(tmp_seekable_path):
                     try:
-                        os.remove(canonical_seekable_path)
+                        os.remove(tmp_seekable_path)
                     except Exception:
                         pass
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to remux recording into seekable format.",
+                    detail="Failed to prepare recording for mobile playback.",
                 )
+
+            if not _has_mobile_compatible_aac(tmp_seekable_path):
+                logger.error(
+                    "FFmpeg output for session %s is missing mobile-compatible AAC metadata",
+                    session.id,
+                )
+                try:
+                    os.remove(tmp_seekable_path)
+                except OSError:
+                    pass
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Recording audio is not compatible with mobile playback.",
+                )
+
+            os.replace(tmp_seekable_path, canonical_seekable_path)
         finally:
+            if os.path.exists(tmp_seekable_path):
+                try:
+                    os.remove(tmp_seekable_path)
+                except OSError:
+                    pass
             if os.path.exists(raw_path):
                 try:
                     os.remove(raw_path)
