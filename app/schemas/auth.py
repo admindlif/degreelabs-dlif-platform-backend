@@ -113,7 +113,7 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     requires_2fa: bool
     requires_2fa_setup: bool = False
-    available_methods: list[str] = ["authenticator"]
+    available_methods: list[str] | None = None
     default_method: str | None = None
     masked_email: str | None = None
 

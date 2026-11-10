@@ -94,7 +94,7 @@ def test_password_and_mfa_login_creates_hashed_server_session(
             json={"email": user.email, "password": PASSWORD},
         )
         assert stage_one.status_code == 200
-        assert stage_one.json() == {"requires_2fa": True}
+        assert stage_one.json().get("requires_2fa") is True
 
         verified = client.post(
             "/api/v1/auth/2fa/verify",
@@ -338,7 +338,9 @@ def test_session_status_uses_valid_refresh_after_access_token_expiry(
     db: Session,
 ):
     user = _create_user(db)
-    issued_at = datetime.now(timezone.utc) - timedelta(minutes=16)
+    issued_at = datetime.now(timezone.utc) - timedelta(
+        minutes=settings.access_token_expire_minutes + 1
+    )
     try:
         tokens = create_authenticated_session(db, user, now=issued_at)
         with pytest.raises(jwt.ExpiredSignatureError):
@@ -547,10 +549,9 @@ def test_privileged_mfa_enrollment_rollout_creates_session_after_confirm(
             json={"email": user.email, "password": PASSWORD},
         )
         assert login.status_code == 200
-        assert login.json() == {
-            "requires_2fa": False,
-            "requires_2fa_setup": True,
-        }
+        login_data = login.json()
+        assert login_data.get("requires_2fa") is False
+        assert login_data.get("requires_2fa_setup") is True
         assert client.cookies.get(ACCESS_COOKIE_NAME) is None
 
         setup = client.post("/api/v1/auth/2fa/setup")

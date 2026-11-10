@@ -1,4 +1,4 @@
-﻿from app.models.cohort import Cohort, CohortStatus
+from app.models.cohort import Cohort, CohortStatus
 from app.models.enrollment import Enrollment, EnrollmentStatus
 from app.models.phase import Phase
 from app.models.program import Program
