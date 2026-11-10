@@ -466,7 +466,7 @@ def verify_login_credentials(
         default_method = None
         if user.preferred_auth_method in available_methods:
             default_method = user.preferred_auth_method
-        elif "email_otp" in available_methods and not user.totp_secret:
+        elif "email_otp" in available_methods:
             default_method = "email_otp"
         elif "authenticator" in available_methods:
             default_method = "authenticator"
