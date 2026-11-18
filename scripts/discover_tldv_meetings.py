@@ -33,7 +33,9 @@ backend_dir = Path(__file__).resolve().parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
+from sqlalchemy.orm import joinedload
 from app.db.session import SessionLocal
+from app.models.cohort import Cohort
 from app.models.session import (
     RecordingProcessingStatus,
     Session as DBSession,
@@ -88,6 +90,24 @@ def parse_happened_at(raw: str | None) -> datetime | None:
         return None
 
 
+def _extract_batch_number(text: str | None) -> int | None:
+    """
+    Extract the numeric batch number from a cohort name or meeting title.
+
+    Examples:
+        "Batch 02"                                            -> 2
+        "DLIF Batch 2"                                        -> 2
+        "DLIF Induction (Batch 02)"                           -> 2
+        "DLIF Discover Batch 2 Session-02|Problem Framing..." -> 2
+        "DLIF Discover Batch-2 Session 01"                    -> 2
+        "Cohort 1"                                            -> None
+    """
+    if not text:
+        return None
+    m = re.search(r"\bbatch[ -]*0*(\d+)\b", text, re.I)
+    return int(m.group(1)) if m else None
+
+
 def _is_candidate(
     meeting: TLDVMeetingData,
     session: DBSession,
@@ -107,7 +127,19 @@ def _is_candidate(
         if session.meeting_url and norm_conf in session.meeting_url.lower():
             return True
 
-    # 2. Strong match on "dlif" + session number / title
+    # 2. Batch Number Consistency Check:
+    # If the session's cohort specifies a batch number (e.g. Batch 02)
+    # AND the meeting title also specifies a batch number (e.g. Batch 01),
+    # disqualify immediately to prevent cross-batch contamination.
+    cohort_name = getattr(session.cohort, "name", None) if hasattr(session, "cohort") and session.cohort else None
+    cohort_batch_num = _extract_batch_number(cohort_name)
+    meeting_batch_num = _extract_batch_number(meeting.name)
+
+    if cohort_batch_num is not None and meeting_batch_num is not None:
+        if cohort_batch_num != meeting_batch_num:
+            return False
+
+    # 3. Strong match on "dlif" + session number / title
     if _REQUIRED_KEYWORD in name_lower:
         s_num = session.session_number
         patterns = [
@@ -115,7 +147,10 @@ def _is_candidate(
             rf"\bsession[ -]*{s_num:02d}\b",
         ]
         if s_num == 0:
-            patterns.append(r"\binduction\b")
+            patterns.extend([
+                r"\binduction\b",
+                r"\bsession[ -]*0?0\b",
+            ])
 
         for pat in patterns:
             if re.search(pat, name_lower):
@@ -125,7 +160,7 @@ def _is_candidate(
                 if (meeting.duration_seconds or 0) >= _MIN_DURATION_SECONDS:
                     return True
 
-    # 3. Time window heuristic match (within ±2h of session.start_at)
+    # 4. Time window heuristic match (within ±2h of session.start_at)
     happened_at = parse_happened_at(meeting.happened_at)
     if (
         session.start_at
@@ -144,6 +179,77 @@ def _is_candidate(
     return False
 
 
+def _disambiguate_candidates(
+    session: DBSession,
+    candidates: list[TLDVMeetingData],
+) -> list[TLDVMeetingData]:
+    """
+    Safely resolve multiple candidate meetings for a session.
+    Prioritizes:
+    1. Candidate matching the specific session title (e.g. 'Problem Framing & Diagnosis')
+    2. Candidate explicitly matching the cohort batch number
+    3. Full session recording (>= 3600s) over shorter snippets (e.g. 1h 40m vs 31m)
+    4. Candidate with happened_at closest to session.start_at
+    """
+    if len(candidates) <= 1:
+        return candidates
+
+    # 1. Prefer candidate whose meeting title contains the session's specific title
+    if session.title and len(session.title.strip()) > 3:
+        norm_title = session.title.strip().lower()
+        title_matches = [
+            m for m in candidates
+            if norm_title in (m.name or "").lower()
+        ]
+        if len(title_matches) == 1:
+            return title_matches
+        if len(title_matches) > 1:
+            candidates = title_matches
+
+    # 2. Prefer candidate explicitly matching the cohort's batch number
+    cohort_name = getattr(session.cohort, "name", None) if hasattr(session, "cohort") and session.cohort else None
+    cohort_batch_num = _extract_batch_number(cohort_name)
+    if cohort_batch_num is not None:
+        batch_matches = [
+            m for m in candidates
+            if _extract_batch_number(m.name) == cohort_batch_num
+        ]
+        if len(batch_matches) == 1:
+            return batch_matches
+        if len(batch_matches) > 1:
+            candidates = batch_matches
+
+    # 3. Prefer full session recordings over short snippets (e.g. 1h 40m vs 31m)
+    long_candidates = [
+        m for m in candidates
+        if (m.duration_seconds or 0) >= 3600
+    ]
+    if len(long_candidates) == 1:
+        return long_candidates
+    elif len(long_candidates) > 1:
+        candidates = long_candidates
+
+    # 4. If session.start_at is known, pick the one closest to session.start_at
+    if session.start_at and len(candidates) > 1:
+        session_start = session.start_at
+        if session_start.tzinfo is None:
+            session_start = session_start.replace(tzinfo=timezone.utc)
+
+        def _time_diff(m: TLDVMeetingData) -> float:
+            happened = parse_happened_at(m.happened_at)
+            if not happened:
+                return float("inf")
+            return abs((happened - session_start).total_seconds())
+
+        sorted_by_time = sorted(candidates, key=_time_diff)
+        diff_0 = _time_diff(sorted_by_time[0])
+        diff_1 = _time_diff(sorted_by_time[1])
+        if diff_0 <= _MATCH_WINDOW_HOURS * 3600 and (diff_1 - diff_0) >= 1800:
+            return [sorted_by_time[0]]
+
+    return candidates
+
+
 
 def run_discovery(execute: bool = False) -> int:
     """
@@ -160,7 +266,12 @@ def run_discovery(execute: bool = False) -> int:
 
     # Build a set of already-used meeting IDs (referenced by any session)
     with SessionLocal() as db:
-        all_sessions = db.query(DBSession).order_by(DBSession.session_number).all()
+        all_sessions = (
+            db.query(DBSession)
+            .options(joinedload(DBSession.cohort))
+            .order_by(DBSession.session_number)
+            .all()
+        )
         already_used: set[str] = {
             s.tldv_meeting_id
             for s in all_sessions
@@ -189,6 +300,9 @@ def run_discovery(execute: bool = False) -> int:
             m for m in all_meetings
             if _is_candidate(m, session, already_used)
         ]
+
+        if len(candidates) > 1:
+            candidates = _disambiguate_candidates(session, candidates)
 
         if len(candidates) == 1:
             auto_matches.append((session, candidates[0]))
@@ -262,6 +376,7 @@ def run_discovery(execute: bool = False) -> int:
                 continue
 
             db_session.tldv_meeting_id = meeting.meeting_id
+            db_session.is_unlocked = True
 
             # Populate missing session timestamps from the tl;dv meeting
             happened_at = parse_happened_at(meeting.happened_at)
